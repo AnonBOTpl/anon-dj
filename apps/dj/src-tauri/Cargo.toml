@@ -44,3 +44,8 @@ tokio-tungstenite = "0.30.0"
 # Metody `next()`/`send()` na strumieniu WebSocket to cechy z `futures` — `tokio-tungstenite`
 # sam ich nie wystawia. Crate jest już w drzewie zależności (ciągnie go Tauri).
 futures-util = "0.3.34"
+# Synteza mowy (Piper) w Rustcie. `piper-rs` odpada: buduje espeak-ng przez bindgen i CMake
+# (potrzebne libclang i cmake), a jego ONNX Runtime wymaga AVX2 i wywraca się na FX-8300.
+# `sherpa-onnx` linkuje gotowe biblioteki statyczne pobierane raz w buildzie (skrypt budujący
+# używa do tego `ureq`/`tar`/`bzip2`/`zip`) — bez dodatkowych narzędzi i bez AVX2. (PLAN.md, sekcja 8)
+sherpa-onnx = "1.13.8"

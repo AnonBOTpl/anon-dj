@@ -4,6 +4,8 @@ mod db;
 mod library;
 mod logging;
 mod net;
+// Silnik lektora: głosy Piper uruchamiane przez `sherpa-onnx`.
+mod piper;
 mod settings;
 // Publiczny, bo kontrakt lektora (`TtsProvider`) jest zamierzony jako punkt wejścia dla silników
 // TTS — dopóki nic go nie woła z wewnątrz, prywatny moduł zgłaszałby martwy kod.
@@ -47,6 +49,8 @@ struct AppState {
     scanning: Arc<AtomicBool>,
     /// Serwer LAN dla kiosków.
     server: Arc<net::Server>,
+    /// Lektor dedykacji — albo gotowy, albo wyłączony z podanym powodem.
+    tts: piper::TtsRuntime,
 }
 
 impl AppState {
@@ -56,6 +60,7 @@ impl AppState {
         log_dir: PathBuf,
         settings: Arc<Mutex<AppSettings>>,
         server: Arc<net::Server>,
+        tts: piper::TtsRuntime,
     ) -> Self {
         Self {
             db,
@@ -64,7 +69,32 @@ impl AppState {
             settings,
             scanning: Arc::new(AtomicBool::new(false)),
             server,
+            tts,
         }
+    }
+}
+
+/// Stan lektora dla interfejsu DJ-a.
+#[derive(Debug, Clone, serde::Serialize)]
+struct TtsStatus {
+    /// Czy da się przeczytać dedykację.
+    available: bool,
+    /// Głos, którym mówimy (a gdy lektora nie ma — `null`).
+    selected: Option<String>,
+    /// Dlaczego lektora nie ma — DJ ma wiedzieć, co poprawić.
+    reason: Option<String>,
+    /// Głosy znalezione na dysku.
+    voices: Vec<piper::Voice>,
+}
+
+/// Stan lektora: jakie głosy są zainstalowane i czy da się czytać dedykacje.
+#[tauri::command]
+fn tts_status(state: tauri::State<'_, AppState>) -> TtsStatus {
+    TtsStatus {
+        available: state.tts.is_available(),
+        selected: state.tts.selected().map(str::to_string),
+        reason: state.tts.unavailable_reason().map(str::to_string),
+        voices: state.tts.voices().to_vec(),
     }
 }
 
@@ -652,7 +682,8 @@ pub fn run() {
             let handle = app.handle();
 
             let log_dir = handle.path().app_log_dir()?;
-            let db_path = handle.path().app_data_dir()?.join("anon-dj.sqlite");
+            let app_data_dir = handle.path().app_data_dir()?;
+            let db_path = app_data_dir.join("anon-dj.sqlite");
 
             // Strażnik logowania plikowego ma żyć dokładnie tyle, ile proces, więc celowo
             // go „wyciekamy” — zwolnienie nastąpi razem z zakończeniem programu.
@@ -692,7 +723,38 @@ pub fn run() {
             server.spawn();
             spawn_ui_forwarder(app.handle().clone(), Arc::clone(&server), ui_rx);
 
-            app.manage(AppState::new(db, db_path, log_dir, settings, server));
+            // Lektor przygotowujemy z gotowych plików; brak głosów nie może zatrzymać startu —
+            // wtedy aplikacja działa bez voice-overu, a DJ czyta dedykację z ekranu.
+            let voices_dir = piper::default_voices_dir(&app_data_dir);
+            let tts = match piper::discover_voices(&voices_dir) {
+                Ok(voices) => {
+                    let preferred = settings
+                        .lock()
+                        .map(|settings| settings.tts.voice.clone())
+                        .unwrap_or_default();
+                    let cache = crate::tts::ClipCache::new(app_data_dir.join("tts-cache"));
+
+                    piper::TtsRuntime::prepare(voices, &preferred, cache)
+                }
+                Err(error) => {
+                    warn!(error = %error, "nie udało się wypisać głosów lektora, wyłączam lektora");
+
+                    piper::TtsRuntime::unavailable(error.to_string())
+                }
+            };
+
+            match (tts.selected(), tts.unavailable_reason()) {
+                (Some(voice), _) => {
+                    info!(voice, voices_dir = %voices_dir.display(), "lektor gotowy")
+                }
+                (None, reason) => warn!(
+                    voices_dir = %voices_dir.display(),
+                    reason = reason.unwrap_or("nieznany powód"),
+                    "lektor niedostępny — dedykacje trzeba przeczytać z ekranu"
+                ),
+            };
+
+            app.manage(AppState::new(db, db_path, log_dir, settings, server, tts));
             info!("aplikacja DJ-a gotowa");
 
             Ok(())
@@ -716,7 +778,8 @@ pub fn run() {
             approve_request,
             reject_request,
             update_dedication,
-            move_request
+            move_request,
+            tts_status
         ])
         .run(tauri::generate_context!())
         .expect("nie udało się uruchomić aplikacji ANON DJ");

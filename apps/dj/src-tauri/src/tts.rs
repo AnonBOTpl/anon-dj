@@ -10,7 +10,7 @@
 //! Klip jest adresowany treścią: nazwa pliku to skrót z głosu, tekstu i strojenia. Zmiana
 //! któregokolwiek z nich daje nowy plik, a powtórzenie tej samej dedykacji nie liczy nic drugi raz.
 
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 /// Gotowy do odtworzenia klip z dedykacją.
@@ -39,6 +39,10 @@ pub struct VoiceTuning {
     pub sentence_silence_ms: u32,
 }
 
+/// Pauza między zdaniami, od której startujemy. Jednocześnie punkt odniesienia dla silnika:
+/// `sherpa-onnx` przyjmuje pauzę jako mnożnik, więc dzielimy przez tę wartość.
+pub const DEFAULT_SENTENCE_SILENCE_MS: u32 = 200;
+
 impl Default for VoiceTuning {
     fn default() -> Self {
         // Domyślne wartości z modeli Piper (`inference` w pliku `.onnx.json`).
@@ -47,7 +51,7 @@ impl Default for VoiceTuning {
             noise_scale_milli: 667,
             noise_w_milli: 800,
             volume_percent: 100,
-            sentence_silence_ms: 200,
+            sentence_silence_ms: DEFAULT_SENTENCE_SILENCE_MS,
         }
     }
 }
@@ -87,7 +91,7 @@ pub enum TtsError {
 }
 
 impl TtsError {
-    fn io(path: &Path, source: std::io::Error) -> Self {
+    pub(crate) fn io(path: &Path, source: std::io::Error) -> Self {
         Self::Io {
             path: path.to_path_buf(),
             source,
@@ -109,6 +113,7 @@ pub trait TtsProvider: Send + Sync {
 }
 
 /// Pamięć podręczna klipów: katalog na dysku i nazwy plików wyliczane z treści.
+#[derive(Debug, Clone)]
 pub struct ClipCache {
     dir: PathBuf,
 }
@@ -230,6 +235,41 @@ pub fn write_wav(path: &Path, samples: &[f32], sample_rate: u32) -> Result<Clip,
     })
 }
 
+/// Odczytuje klip zapisany wcześniej przez [`write_wav`].
+///
+/// Format jest nasz i stały — 44-bajtowy nagłówek i 16-bitowy PCM mono — więc długość liczymy
+/// prosto z rozmiaru danych. Dzięki temu klip czekający w pamięci podręcznej nie wymaga
+/// ponownej syntezy tylko po to, żeby poznać jego długość.
+pub fn read_clip(path: &Path) -> Result<Clip, TtsError> {
+    let mut header = [0u8; 44];
+
+    let mut file = std::fs::File::open(path).map_err(|error| TtsError::io(path, error))?;
+    file.read_exact(&mut header)
+        .map_err(|error| TtsError::io(path, error))?;
+
+    if &header[0..4] != b"RIFF" || &header[8..12] != b"WAVE" {
+        return Err(TtsError::Synthesis(format!(
+            "{} nie jest plikiem WAV",
+            path.display()
+        )));
+    }
+
+    let sample_rate = u32::from_le_bytes([header[24], header[25], header[26], header[27]]);
+    let data_len = u32::from_le_bytes([header[40], header[41], header[42], header[43]]);
+
+    let duration_ms = if sample_rate == 0 {
+        0
+    } else {
+        u32::try_from(u64::from(data_len) * 1_000 / 2 / u64::from(sample_rate)).unwrap_or(u32::MAX)
+    };
+
+    Ok(Clip {
+        path: path.to_path_buf(),
+        duration_ms,
+        sample_rate,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -313,6 +353,38 @@ mod tests {
         cache
             .forget("justyna", "Sto lat!", &tuning)
             .expect("usunięcie nieistniejącego klipu");
+    }
+
+    #[test]
+    fn a_clip_on_disk_can_be_read_back_without_synthesis() {
+        let dir = temp_dir("read-back");
+        let cache = ClipCache::new(dir);
+        let tuning = VoiceTuning::default();
+        let path = cache.path_for("justyna", "Dla Kasi", &tuning);
+
+        // Pół sekundy przy 16 000 Hz.
+        write_wav(&path, &vec![0.0_f32; 8_000], 16_000).expect("zapis klipu");
+
+        let clip = read_clip(&path).expect("odczyt klipu");
+
+        assert_eq!(clip.duration_ms, 500);
+        assert_eq!(clip.sample_rate, 16_000);
+        assert_eq!(clip.path, path);
+    }
+
+    #[test]
+    fn a_file_that_is_not_a_wav_is_rejected() {
+        let dir = temp_dir("not-a-wav");
+        let path = dir.join("dedykacja.wav");
+
+        // Plik ma pełny nagłówek, ale nie jest plikiem WAV — sprawdzamy samą sygnaturę.
+        std::fs::write(&path, vec![0_u8; 64]).expect("zapis pliku");
+
+        assert!(matches!(read_clip(&path), Err(TtsError::Synthesis(_))));
+        assert!(matches!(
+            read_clip(&dir.join("nie-ma-takiego.wav")),
+            Err(TtsError::Io { .. })
+        ));
     }
 
     #[test]
