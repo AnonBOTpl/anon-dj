@@ -547,7 +547,6 @@ mod tests {
         assert_eq!(runtime.selected(), None);
         assert!(runtime.unavailable_reason().is_some());
     }
-
     /// Synteza prawdziwym modelem — jedyny test, który dotyka `sherpa-onnx`.
     ///
     /// Modele nie leżą w repozytorium, więc test jest domyślnie pomijany. Uruchomienie:
@@ -555,23 +554,36 @@ mod tests {
     /// ```text
     /// ANON_DJ_VOICES_DIR=<katalog z głosami> cargo test -p dj the_real_engine -- --ignored --nocapture
     /// ```
+    ///
+    /// `ANON_DJ_VOICE` wybiera głos (domyślnie `justyna`), a `ANON_DJ_SAMPLES_DIR` każe zapisać
+    /// policzony klip pod czytelną nazwą — dzięki temu można odsłuchać głosy jeden po drugim.
     #[test]
     #[ignore = "wymaga katalogu z prawdziwym głosem (ANON_DJ_VOICES_DIR)"]
     fn the_real_engine_synthesizes_a_dedication_and_reuses_the_clip() {
         let dir = std::env::var("ANON_DJ_VOICES_DIR")
             .expect("ustaw ANON_DJ_VOICES_DIR na katalog z głosami");
         let dir = PathBuf::from(dir);
+        let preferred = std::env::var("ANON_DJ_VOICE").unwrap_or_else(|_| "justyna".to_string());
 
         let voices = discover_voices(&dir).expect("wykrywanie głosów");
         assert!(!voices.is_empty(), "w katalogu nie ma żadnego głosu");
 
         let cache = ClipCache::new(dir.join("klipy"));
-        let runtime = TtsRuntime::prepare(voices, "justyna", cache.clone());
+        let runtime = TtsRuntime::prepare(voices, &preferred, cache.clone());
+
+        assert_eq!(
+            runtime.selected(),
+            Some(preferred.as_str()),
+            "głos {preferred} nie został wybrany — czy na pewno jest w katalogu?"
+        );
+
         let provider = runtime.provider.clone().expect("provider lektora");
 
         // Pierwsza dedykacja: silnik startuje i liczy klip.
         let tuning = VoiceTuning::default();
-        let text = "Kochani, mamy dla was dedykację. Kasia i Marek, sto lat!";
+        let text = "Kochani, mamy dla was dedykację. Kasia i Marek, z okazji waszego wesela \
+                    życzymy wam wszystkiego najlepszego. Niech ta muzyka gra dla was do samego rana. \
+                    Sto lat!";
 
         let first = provider.synthesize(text, &tuning).expect("synteza");
 
@@ -588,6 +600,21 @@ mod tests {
             cache.path_for(provider.voice_id(), text, &tuning),
             first.path
         );
+
+        // Na życzenie zapisujemy klip pod czytelną nazwą, żeby można było go odsłuchać.
+        if let Ok(samples_dir) = std::env::var("ANON_DJ_SAMPLES_DIR") {
+            let samples_dir = PathBuf::from(samples_dir);
+            std::fs::create_dir_all(&samples_dir).expect("katalog na próbki");
+
+            let sample = samples_dir.join(format!("{}.wav", provider.voice_id()));
+            std::fs::copy(&first.path, &sample).expect("kopia próbki");
+
+            println!(
+                "próbka: {} ({:.1} s)",
+                sample.display(),
+                first.duration_ms as f32 / 1_000.0
+            );
+        }
     }
 
     #[test]
