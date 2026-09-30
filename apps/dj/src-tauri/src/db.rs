@@ -475,6 +475,45 @@ impl Db {
         Ok(())
     }
 
+    /// Treść dedykacji, którą DJ widzi na ekranie: po jego edycji, a gdy jej nie było — tekst
+    /// gościa. `None` oznacza, że prośby nie ma w bazie.
+    ///
+    /// Z tego jednego źródła bierze się też tekst do syntezy — dzięki temu lektor czyta zawsze
+    /// to, co jest aktualnie na kartach, a nie to, co komenda dostała w parametrze.
+    pub fn dedication(&self, id: i64) -> Result<Option<String>, DbError> {
+        let conn = self.lock()?;
+
+        let dedication = conn
+            .query_row(
+                "SELECT COALESCE(dedication_edited, dedication_original) FROM requests WHERE id = ?1",
+                params![id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+
+        Ok(dedication)
+    }
+
+    /// Zapisuje ścieżkę gotowego klipu lektora; `None` ją czyści.
+    ///
+    /// Czasu zmiany nie ruszamy — policzenie voice-overu nie jest zmianą decyzji DJ-a i nie może
+    /// przez przypadek przestawić kolejności historii.
+    pub fn set_tts_clip_path(&self, id: i64, path: Option<&Path>) -> Result<(), DbError> {
+        let conn = self.lock()?;
+        let stored = path.map(|path| path.to_string_lossy().into_owned());
+
+        let updated = conn.execute(
+            "UPDATE requests SET tts_clip_path = ?2 WHERE id = ?1",
+            params![id, stored],
+        )?;
+
+        if updated == 0 {
+            return Err(DbError::RequestNotFound(id));
+        }
+
+        Ok(())
+    }
+
     /// Przesuwa prośbę w kolejce gotowych o jedno miejsce. `false` oznacza, że nie ma dokąd —
     /// prośba stoi już na początku albo na końcu.
     pub fn move_request(&self, id: i64, up: bool) -> Result<bool, DbError> {
@@ -568,7 +607,7 @@ impl Db {
 /// z tabelami po cichu.
 const QUEUE_COLUMNS: &str = "r.id, r.track_id, t.title, t.artist,
      COALESCE(r.dedication_edited, r.dedication_original), r.guest_name, r.status,
-     r.created_at, r.updated_at";
+     r.created_at, r.updated_at, r.tts_clip_path";
 
 /// Wiersz kolejki odczytany z bazy, jeszcze przed tłumaczeniem statusu.
 struct QueuedRequestRow {
@@ -581,6 +620,7 @@ struct QueuedRequestRow {
     status: String,
     created_at: i64,
     updated_at: i64,
+    tts_clip_path: Option<String>,
 }
 
 impl TryFrom<QueuedRequestRow> for QueuedRequest {
@@ -600,6 +640,7 @@ impl TryFrom<QueuedRequestRow> for QueuedRequest {
             status,
             created_at: row.created_at,
             updated_at: row.updated_at,
+            tts_clip_path: row.tts_clip_path,
         })
     }
 }
@@ -623,6 +664,7 @@ fn query_requests(
             status: row.get(6)?,
             created_at: row.get(7)?,
             updated_at: row.get(8)?,
+            tts_clip_path: row.get(9)?,
         })
     })?;
 
@@ -715,6 +757,8 @@ pub struct QueuedRequest {
     pub created_at: i64,
     /// Czas ostatniej zmiany — po nim sortujemy historię.
     pub updated_at: i64,
+    /// Ścieżka gotowego klipu lektora; `None`, dopóki voice-over nie jest policzony.
+    pub tts_clip_path: Option<String>,
 }
 
 /// Folder wybrany przez DJ-a do skanowania.
@@ -1354,6 +1398,68 @@ mod tests {
         drop(conn);
 
         assert_eq!(original, "dla kasi", "tekst gościa zostaje w bazie");
+    }
+
+    #[test]
+    fn a_clip_path_can_be_stored_and_cleared() {
+        let db = Db::open_in_memory().expect("baza w pamięci");
+        let request = a_request(&db, "Dla Kasi", None);
+
+        db.approve_request(request).expect("zatwierdzenie");
+
+        assert_eq!(
+            db.ready_requests(10).expect("kolejka")[0].tts_clip_path,
+            None,
+            "świeża prośba nie ma jeszcze klipu"
+        );
+
+        db.set_tts_clip_path(request, Some(Path::new("C:\\klipy\\abc.wav")))
+            .expect("zapis ścieżki klipu");
+
+        assert_eq!(
+            db.ready_requests(10).expect("kolejka")[0].tts_clip_path,
+            Some("C:\\klipy\\abc.wav".to_string())
+        );
+
+        // Poprawka dedykacji unieważnia klip — musi dać się wyczyścić.
+        db.set_tts_clip_path(request, None)
+            .expect("wyczyszczenie ścieżki");
+
+        assert_eq!(
+            db.ready_requests(10).expect("kolejka")[0].tts_clip_path,
+            None
+        );
+    }
+
+    #[test]
+    fn a_clip_path_cannot_be_set_for_a_missing_request() {
+        let db = Db::open_in_memory().expect("baza w pamięci");
+
+        assert!(matches!(
+            db.set_tts_clip_path(999, Some(Path::new("C:\\klipy\\abc.wav"))),
+            Err(DbError::RequestNotFound(999))
+        ));
+    }
+
+    #[test]
+    fn dedication_is_the_edited_text_and_falls_back_to_the_guest_text() {
+        let db = Db::open_in_memory().expect("baza w pamięci");
+        let request = a_request(&db, "dla kasi", None);
+
+        assert_eq!(
+            db.dedication(request).expect("odczyt dedykacji"),
+            Some("dla kasi".to_string()),
+            "dopóki nie ma edycji, czytamy tekst gościa"
+        );
+
+        db.set_dedication(request, "Dla Kasi i Marka")
+            .expect("edycja dedykacji");
+
+        assert_eq!(
+            db.dedication(request).expect("odczyt dedykacji"),
+            Some("Dla Kasi i Marka".to_string())
+        );
+        assert_eq!(db.dedication(999).expect("brak prośby"), None);
     }
 
     #[test]

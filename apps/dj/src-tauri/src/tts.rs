@@ -110,6 +110,25 @@ pub trait TtsProvider: Send + Sync {
 
     /// Zamienia tekst dedykacji na klip audio.
     fn synthesize(&self, text: &str, tuning: &VoiceTuning) -> Result<Clip, TtsError>;
+
+    /// To samo co [`TtsProvider::synthesize`], ale melduje postęp syntezy.
+    ///
+    /// `on_progress` dostaje ułamek od 0 do 1 i jest wołany z wątku, który liczy klip — nie
+    /// z wątku interfejsu. Musi być `'static`, bo część silników (np. `sherpa-onnx`) przechowuje
+    /// go na czas generowania. Silnik, który nie umie podać postępu, korzysta z domyślnej
+    /// implementacji: liczy klip i woła `on_progress(1.0)` na końcu.
+    fn synthesize_with_progress(
+        &self,
+        text: &str,
+        tuning: &VoiceTuning,
+        mut on_progress: Box<dyn FnMut(f32) + Send + 'static>,
+    ) -> Result<Clip, TtsError> {
+        let clip = self.synthesize(text, tuning)?;
+
+        on_progress(1.0);
+
+        Ok(clip)
+    }
 }
 
 /// Pamięć podręczna klipów: katalog na dysku i nazwy plików wyliczane z treści.

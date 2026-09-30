@@ -1,5 +1,6 @@
 //! Aplikacja DJ-a ANON DJ: konfiguracja uruchomienia, stan współdzielony i komendy Tauri.
 
+mod clips;
 mod db;
 mod library;
 mod logging;
@@ -35,6 +36,9 @@ const EVENT_REQUESTS_CHANGED: &str = "requests://changed";
 /// Komunikat zwracany, gdy wcześniejszy błąd zostawił ustawienia w stanie zatrutym.
 const SETTINGS_UNAVAILABLE: &str = "ustawienia są chwilowo niedostępne";
 
+/// Komunikat zwracany, gdy nie ma czym przeczytać dedykacji.
+const TTS_UNAVAILABLE: &str = "lektor jest niedostępny";
+
 /// Stan aplikacji współdzielony między komendami Tauri.
 struct AppState {
     db: Arc<Db>,
@@ -51,6 +55,8 @@ struct AppState {
     server: Arc<net::Server>,
     /// Lektor dedykacji — albo gotowy, albo wyłączony z podanym powodem.
     tts: piper::TtsRuntime,
+    /// Zlecenia generowania klipów lektora w tle wraz z postępem dla interfejsu.
+    clips: Arc<clips::ClipJobs>,
 }
 
 impl AppState {
@@ -61,6 +67,7 @@ impl AppState {
         settings: Arc<Mutex<AppSettings>>,
         server: Arc<net::Server>,
         tts: piper::TtsRuntime,
+        clips: Arc<clips::ClipJobs>,
     ) -> Self {
         Self {
             db,
@@ -70,6 +77,7 @@ impl AppState {
             scanning: Arc::new(AtomicBool::new(false)),
             server,
             tts,
+            clips,
         }
     }
 }
@@ -96,6 +104,64 @@ fn tts_status(state: tauri::State<'_, AppState>) -> TtsStatus {
         reason: state.tts.unavailable_reason().map(str::to_string),
         voices: state.tts.voices().to_vec(),
     }
+}
+
+/// Stan klipów lektora. Interfejs pyta o niego po wczytaniu, żeby po przeładowaniu okna
+/// dalej wiedzieć, co się właśnie liczy (zdarzenia sprzed wczytania przepadają).
+#[tauri::command]
+fn clip_states(state: tauri::State<'_, AppState>) -> Vec<clips::ClipProgress> {
+    state.clips.states()
+}
+
+/// Generuje (albo odświeża) klip lektora dla prośby. Zwraca od razu — postęp leci zdarzeniami
+/// `clips://progress`.
+#[tauri::command(rename_all = "snake_case")]
+async fn generate_clip(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    request_id: i64,
+) -> Result<(), String> {
+    start_clip_generation(&app, state.inner(), request_id).await
+}
+
+/// Zamawia klip lektora dla prośby, o ile mamy głos i znamy tekst.
+///
+/// Tekst czytamy z bazy w momencie zlecenia — dzięki temu lektor czyta to, co DJ widzi na
+/// karcie, nawet gdy komenda dostała parametr chwilę wcześniej. Brak głosu nie jest błędem
+/// aplikacji: dedykację można wtedy przeczytać z ekranu (PLAN.md, sekcja 8).
+async fn start_clip_generation(
+    app: &tauri::AppHandle,
+    state: &AppState,
+    request_id: i64,
+) -> Result<(), String> {
+    let provider = match state.tts.provider() {
+        Some(provider) => Arc::clone(provider),
+        None => return Err(TTS_UNAVAILABLE.to_string()),
+    };
+
+    let tuning = {
+        let settings = state
+            .settings
+            .lock()
+            .map_err(|_| SETTINGS_UNAVAILABLE.to_string())?;
+
+        settings.tts.tuning
+    };
+
+    let db = Arc::clone(&state.db);
+    let text = run_db({
+        let db = Arc::clone(&db);
+
+        move || db.dedication(request_id)
+    })
+    .await?
+    .ok_or_else(|| format!("prośba {request_id} nie istnieje"))?;
+
+    state
+        .clips
+        .start(app.clone(), db, provider, tuning, request_id, text);
+
+    Ok(())
 }
 
 /// Stan połączeń z kioskami pokazywany w pasku statusu DJ-a.
@@ -148,8 +214,15 @@ async fn request_history(state: tauri::State<'_, AppState>) -> Result<Vec<Queued
 }
 
 /// Zatwierdza dedykację: prośba przechodzi z kolejki przeglądu do kolejki gotowych.
+///
+/// Zatwierdzenie od razu zamawia klip lektora — „Wykonaj” ma potem tylko odtworzyć gotowy plik
+/// (PLAN.md, sekcja 8). Brak głosu nie przewraca zatwierdzenia.
 #[tauri::command(rename_all = "snake_case")]
-async fn approve_request(state: tauri::State<'_, AppState>, request_id: i64) -> Result<(), String> {
+async fn approve_request(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    request_id: i64,
+) -> Result<(), String> {
     run_db({
         let db = Arc::clone(&state.db);
 
@@ -161,6 +234,10 @@ async fn approve_request(state: tauri::State<'_, AppState>, request_id: i64) -> 
     state.server.notify_queue_changed();
 
     info!(request_id, "prośba zatwierdzona przez DJ-a");
+
+    if let Err(error) = start_clip_generation(&app, state.inner(), request_id).await {
+        warn!(request_id, error = %error, "nie udało się zamówić klipu lektora");
+    }
 
     Ok(())
 }
@@ -178,6 +255,9 @@ async fn reject_request(state: tauri::State<'_, AppState>, request_id: i64) -> R
     notify_kiosk(&state, request_id, RequestStatus::Rejected).await;
     state.server.notify_queue_changed();
 
+    // Odrzucona prośba nie ma już voice-overu — nie trzymamy ani jej stanu, ani liczonego klipu.
+    state.clips.forget(request_id);
+
     info!(request_id, "prośba odrzucona przez DJ-a");
 
     Ok(())
@@ -188,6 +268,7 @@ async fn reject_request(state: tauri::State<'_, AppState>, request_id: i64) -> R
 /// Limit długości bierzemy z ustawień DJ-a — ten sam, który obowiązuje gościa przy wpisywaniu.
 #[tauri::command(rename_all = "snake_case")]
 async fn update_dedication(
+    app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
     request_id: i64,
     dedication: String,
@@ -207,13 +288,25 @@ async fn update_dedication(
     run_db({
         let db = Arc::clone(&state.db);
 
-        move || db.set_dedication(request_id, &dedication)
+        move || -> Result<(), DbError> {
+            db.set_dedication(request_id, &dedication)?;
+
+            // Stary klip czytał stary tekst. Nie może zostać ani chwili dłużej — inaczej DJ
+            // mógłby wykonać dedykację przed policzeniem nowego i puścić nieaktualny voice-over.
+            db.set_tts_clip_path(request_id, None)
+        }
     })
     .await?;
 
     state.server.notify_queue_changed();
 
     info!(request_id, "dedykacja poprawiona przez DJ-a");
+
+    // Poprawiony tekst to nowy voice-over. Zlecenie starsze od tej poprawki straci aktualność
+    // i nie zapisze klipu z tekstem, którego DJ już nie widzi.
+    if let Err(error) = start_clip_generation(&app, state.inner(), request_id).await {
+        warn!(request_id, error = %error, "nie udało się zamówić klipu po poprawce");
+    }
 
     Ok(())
 }
@@ -754,7 +847,11 @@ pub fn run() {
                 ),
             };
 
-            app.manage(AppState::new(db, db_path, log_dir, settings, server, tts));
+            let clips = Arc::new(clips::ClipJobs::new());
+
+            app.manage(AppState::new(
+                db, db_path, log_dir, settings, server, tts, clips,
+            ));
             info!("aplikacja DJ-a gotowa");
 
             Ok(())
@@ -779,7 +876,9 @@ pub fn run() {
             reject_request,
             update_dedication,
             move_request,
-            tts_status
+            tts_status,
+            clip_states,
+            generate_clip
         ])
         .run(tauri::generate_context!())
         .expect("nie udało się uruchomić aplikacji ANON DJ");

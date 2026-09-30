@@ -1,9 +1,20 @@
 import { useState, type MouseEvent, type ReactNode } from "react";
 import { motion } from "framer-motion";
-import { Check, Pencil, User, X } from "lucide-react";
+import {
+  Check,
+  CircleCheck,
+  Hourglass,
+  LoaderCircle,
+  Mic,
+  Pencil,
+  TriangleAlert,
+  Undo2,
+  User,
+  X,
+} from "lucide-react";
 
 import { ui } from "../text";
-import type { QueuedRequest } from "../types";
+import type { QueuedRequest, VoiceOverState } from "../types";
 
 /** Godzina zgłoszenia — DJ patrzy na kolejkę chronologicznie. */
 function formatTime(timestamp: number): string {
@@ -11,6 +22,104 @@ function formatTime(timestamp: number): string {
     hour: "2-digit",
     minute: "2-digit",
   });
+}
+
+const smallButton =
+  "flex shrink-0 items-center gap-1.5 rounded border border-scena-700 px-2 py-1 text-xs transition-colors hover:bg-scena-800 disabled:opacity-40";
+
+/**
+ * Stan voice-overu: czy lektor już przeczytał dedykację, czy właśnie ją liczy.
+ *
+ * Generowanie jest poprzedzone i otoczone widocznym statusem oraz paskiem postępu (PLAN.md,
+ * sekcja 8) — DJ nie musi zgadywać, czy voice-over zdąży przed „Wykonaj”, a gdy synteza padnie,
+ * dostaje powód i przycisk ponowienia.
+ */
+function VoiceOverStatus({
+  state,
+  ttsAvailable,
+  disabled,
+  onGenerate,
+}: {
+  state: VoiceOverState;
+  ttsAvailable: boolean;
+  disabled: boolean;
+  onGenerate?: () => void;
+}) {
+  const generate = (event: MouseEvent<HTMLButtonElement>) => {
+    event.stopPropagation();
+    onGenerate?.();
+  };
+
+  if (state.status === "missing") {
+    if (!ttsAvailable) {
+      return (
+        <p className="mt-2 flex items-center gap-1.5 text-xs text-zinc-500">
+          <TriangleAlert className="h-3 w-3 shrink-0" />
+          {ui.queue.voiceOver.unavailable}
+        </p>
+      );
+    }
+
+    return (
+      <div className="mt-2 flex items-center gap-2 text-xs text-zinc-500">
+        <Hourglass className="h-3 w-3 shrink-0" />
+        {ui.queue.voiceOver.missing}
+        <button type="button" onClick={generate} disabled={disabled} className={smallButton}>
+          <Mic className="h-3.5 w-3.5" />
+          {ui.queue.voiceOver.generate}
+        </button>
+      </div>
+    );
+  }
+
+  if (state.status === "generating") {
+    return (
+      <div className="mt-2 space-y-1">
+        <p className="flex items-center gap-1.5 text-xs text-zinc-400">
+          <LoaderCircle className="h-3 w-3 shrink-0 animate-spin" />
+          {ui.queue.voiceOver.generating}
+          <span className="tabular-nums text-zinc-500">
+            {state.progress}
+            {ui.queue.voiceOver.percentSuffix}
+          </span>
+        </p>
+        <div
+          role="progressbar"
+          aria-valuemin={0}
+          aria-valuemax={100}
+          aria-valuenow={state.progress}
+          className="h-1.5 w-full overflow-hidden rounded-full bg-scena-800"
+        >
+          <div
+            className="h-full rounded-full bg-zinc-300 transition-[width] duration-300 ease-out"
+            style={{ width: `${state.progress}%` }}
+          />
+        </div>
+      </div>
+    );
+  }
+
+  if (state.status === "failed") {
+    return (
+      <div className="mt-2 flex items-center gap-2 text-xs text-amber-400">
+        <TriangleAlert className="h-3 w-3 shrink-0" />
+        <span className="min-w-0 flex-1 truncate" title={state.message ?? undefined}>
+          {ui.queue.voiceOver.failed} {state.message ?? ""}
+        </span>
+        <button type="button" onClick={generate} disabled={disabled} className={smallButton}>
+          <Undo2 className="h-3.5 w-3.5" />
+          {ui.queue.voiceOver.retry}
+        </button>
+      </div>
+    );
+  }
+
+  return (
+    <p className="mt-2 flex items-center gap-1.5 text-xs text-emerald-400">
+      <CircleCheck className="h-3 w-3 shrink-0" />
+      {ui.queue.voiceOver.ready}
+    </p>
+  );
 }
 
 type RequestCardProps = {
@@ -28,6 +137,12 @@ type RequestCardProps = {
   maxChars: number;
   /** Blokuje przyciski na czas operacji na bazie. */
   disabled?: boolean;
+  /** Stan voice-overu; brak oznacza, że karta go nie pokazuje (np. historia). */
+  voiceOver?: VoiceOverState;
+  /** Zamówienie voice-overu — przycisk pokazuje się, gdy klipu jeszcze nie ma. */
+  onGenerateVoiceOver?: () => void;
+  /** Czy lektor jest w ogóle dostępny; bez tego przycisk tylko wprowadzałby w błąd. */
+  ttsAvailable?: boolean;
 };
 
 /**
@@ -42,6 +157,9 @@ export function RequestCard({
   footnote,
   maxChars,
   disabled = false,
+  voiceOver,
+  onGenerateVoiceOver,
+  ttsAvailable = false,
 }: RequestCardProps) {
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState(request.dedication);
@@ -121,6 +239,15 @@ export function RequestCard({
 
         <span className="shrink-0 tabular-nums">{formatTime(request.created_at)}</span>
       </div>
+
+      {voiceOver !== undefined && (
+        <VoiceOverStatus
+          state={voiceOver}
+          ttsAvailable={ttsAvailable}
+          disabled={disabled}
+          onGenerate={onGenerateVoiceOver}
+        />
+      )}
 
       {(editable || actions !== undefined || footnote !== undefined) && (
         <div className="mt-2 flex items-center gap-2">

@@ -263,6 +263,66 @@ impl PiperTts {
             engine: Mutex::new(None),
         }
     }
+
+    /// Wspólna droga liczenia klipu. `on_progress` dostaje ułamek od 0 do 1; przy trafieniu
+    /// w pamięć podręczną wołamy go raz z `1.0`, bo klip jest już gotowy.
+    fn synthesize_inner(
+        &self,
+        text: &str,
+        tuning: &VoiceTuning,
+        mut on_progress: Box<dyn FnMut(f32) + Send + 'static>,
+    ) -> Result<Clip, TtsError> {
+        let path = self.cache.path_for(&self.voice.id, text, tuning);
+
+        // Klip policzony wcześniej — nie ma po co uruchamiać silnika.
+        if path.is_file() {
+            on_progress(1.0);
+
+            return read_clip(&path);
+        }
+
+        let mut guard = self
+            .engine
+            .lock()
+            .map_err(|_| TtsError::Synthesis("silnik lektora jest niedostępny".to_string()))?;
+
+        let noise = (tuning.noise_scale_milli, tuning.noise_w_milli);
+
+        if guard.as_ref().map(|engine| engine.noise) != Some(noise) {
+            *guard = Some(Engine::create(&self.voice, tuning)?);
+        }
+
+        let engine = guard
+            .as_ref()
+            .ok_or_else(|| TtsError::Synthesis("silnik lektora nie jest gotowy".to_string()))?;
+
+        let generation = GenerationConfig {
+            // W Piperze `length_scale` jest odwrotnością tempa: większe znaczy wolniej.
+            speed: 1.0 / tuning.length_scale().max(0.1),
+            // `silence_scale` to mnożnik pauzy, więc nasze milisekundy przeliczamy na krotność.
+            silence_scale: tuning.sentence_silence_ms as f32
+                / crate::tts::DEFAULT_SENTENCE_SILENCE_MS as f32,
+            sid: 0,
+            ..Default::default()
+        };
+
+        // Silnik melduje postęp po każdym zdaniu — z tego bierze się pasek postępu w interfejsie.
+        // Callback silnika musi być `'static`, więc przejmujemy nim własność (stąd `move`).
+        let callback = move |_samples: &[f32], progress: f32| -> bool {
+            on_progress(progress.clamp(0.0, 1.0));
+
+            true
+        };
+
+        let audio = engine
+            .tts
+            .generate_with_config(text, &generation, Some(callback))
+            .ok_or_else(|| TtsError::Synthesis("silnik nie zwrócił dźwięku".to_string()))?;
+
+        let sample_rate = u32::try_from(audio.sample_rate()).unwrap_or(0);
+
+        write_wav(&path, audio.samples(), sample_rate)
+    }
 }
 
 /// Stan lektora w aplikacji: gotowy provider albo powód, dla którego go nie ma.
@@ -332,6 +392,12 @@ impl TtsRuntime {
     pub fn unavailable_reason(&self) -> Option<&str> {
         self.unavailable.as_deref()
     }
+
+    /// Provider lektora, jeśli jest gotowy. Generowanie klipów w tle bierze go stąd, żeby
+    /// komenda nie musiała znac ani jednego typu silnika (PLAN.md, sekcja 8).
+    pub fn provider(&self) -> Option<&Arc<dyn TtsProvider>> {
+        self.provider.as_ref()
+    }
 }
 
 impl TtsProvider for PiperTts {
@@ -340,46 +406,16 @@ impl TtsProvider for PiperTts {
     }
 
     fn synthesize(&self, text: &str, tuning: &VoiceTuning) -> Result<Clip, TtsError> {
-        let path = self.cache.path_for(&self.voice.id, text, tuning);
+        self.synthesize_inner(text, tuning, Box::new(|_| {}))
+    }
 
-        // Klip policzony wcześniej — nie ma po co uruchamiać silnika.
-        if path.is_file() {
-            return read_clip(&path);
-        }
-
-        let mut guard = self
-            .engine
-            .lock()
-            .map_err(|_| TtsError::Synthesis("silnik lektora jest niedostępny".to_string()))?;
-
-        let noise = (tuning.noise_scale_milli, tuning.noise_w_milli);
-
-        if guard.as_ref().map(|engine| engine.noise) != Some(noise) {
-            *guard = Some(Engine::create(&self.voice, tuning)?);
-        }
-
-        let engine = guard
-            .as_ref()
-            .ok_or_else(|| TtsError::Synthesis("silnik lektora nie jest gotowy".to_string()))?;
-
-        let generation = GenerationConfig {
-            // W Piperze `length_scale` jest odwrotnością tempa: większe znaczy wolniej.
-            speed: 1.0 / tuning.length_scale().max(0.1),
-            // `silence_scale` to mnożnik pauzy, więc nasze milisekundy przeliczamy na krotność.
-            silence_scale: tuning.sentence_silence_ms as f32
-                / crate::tts::DEFAULT_SENTENCE_SILENCE_MS as f32,
-            sid: 0,
-            ..Default::default()
-        };
-
-        let audio = engine
-            .tts
-            .generate_with_config(text, &generation, None::<fn(&[f32], f32) -> bool>)
-            .ok_or_else(|| TtsError::Synthesis("silnik nie zwrócił dźwięku".to_string()))?;
-
-        let sample_rate = u32::try_from(audio.sample_rate()).unwrap_or(0);
-
-        write_wav(&path, audio.samples(), sample_rate)
+    fn synthesize_with_progress(
+        &self,
+        text: &str,
+        tuning: &VoiceTuning,
+        on_progress: Box<dyn FnMut(f32) + Send + 'static>,
+    ) -> Result<Clip, TtsError> {
+        self.synthesize_inner(text, tuning, on_progress)
     }
 }
 
@@ -515,6 +551,49 @@ mod tests {
     }
 
     #[test]
+    fn a_cached_clip_reports_full_progress_without_touching_the_engine() {
+        let root = temp_dir("progress-cached");
+        let voices = {
+            voice_dir(&root, "justyna", true, None);
+            discover_voices(&root).expect("wykrywanie głosów")
+        };
+
+        let cache = ClipCache::new(root.join("klipy"));
+        let provider = PiperTts::new(voices[0].clone(), cache);
+        let tuning = VoiceTuning::default();
+        let text = "Dla Kasi";
+
+        write_wav(
+            &provider.cache.path_for(provider.voice_id(), text, &tuning),
+            &vec![0.0_f32; 4_000],
+            8_000,
+        )
+        .expect("zapis klipu");
+
+        let reported = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&reported);
+
+        provider
+            .synthesize_with_progress(
+                text,
+                &tuning,
+                Box::new(move |value| {
+                    if let Ok(mut values) = sink.lock() {
+                        values.push(value);
+                    }
+                }),
+            )
+            .expect("klip z pamięci podręcznej");
+
+        assert_eq!(
+            reported.lock().expect("blokada").as_slice(),
+            [1.0],
+            "klip z pamięci podręcznej melduje pełny postęp i nic nie liczy"
+        );
+        assert!(provider.engine.lock().expect("blokada silnika").is_none());
+    }
+
+    #[test]
     fn the_runtime_falls_back_to_an_available_voice() {
         let root = temp_dir("runtime");
 
@@ -579,13 +658,44 @@ mod tests {
 
         let provider = runtime.provider.clone().expect("provider lektora");
 
-        // Pierwsza dedykacja: silnik startuje i liczy klip.
+        // Pierwsza dedykacja: silnik startuje i liczy klip. Kasujemy ewentualny klip z poprzedniego
+        // przebiegu, żeby za każdym razem sprawdzić prawdziwą syntezę, a nie samą pamięć podręczną.
         let tuning = VoiceTuning::default();
         let text = "Kochani, mamy dla was dedykację. Kasia i Marek, z okazji waszego wesela \
                     życzymy wam wszystkiego najlepszego. Niech ta muzyka gra dla was do samego rana. \
                     Sto lat!";
 
-        let first = provider.synthesize(text, &tuning).expect("synteza");
+        cache
+            .forget(provider.voice_id(), text, &tuning)
+            .expect("wyczyszczenie klipu");
+
+        let reported = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&reported);
+
+        let first = provider
+            .synthesize_with_progress(
+                text,
+                &tuning,
+                Box::new(move |value| {
+                    if let Ok(mut values) = sink.lock() {
+                        values.push(value);
+                    }
+                }),
+            )
+            .expect("synteza");
+
+        // Lektor musi meldować postęp — z niego bierze się pasek postępu w interfejsie.
+        let progress = reported.lock().expect("blokada").clone();
+
+        assert!(!progress.is_empty(), "silnik musi meldować postęp syntezy");
+        assert!(
+            progress.iter().all(|value| (0.0..=1.0).contains(value)),
+            "postęp musi mieścić się w zakresie 0–1"
+        );
+        assert!(
+            progress.last().copied().unwrap_or(0.0) >= 0.9,
+            "ostatni meldunek musi dojść blisko końca: {progress:?}"
+        );
 
         assert!(first.path.is_file(), "klip musi trafić na dysk");
         assert!(first.duration_ms > 1_000, "nagranie nie może być puste");

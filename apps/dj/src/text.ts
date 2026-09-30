@@ -45,6 +45,18 @@ export const ui = {
     rejectError: "Nie udało się odrzucić dedykacji:",
     editError: "Nie udało się zapisać poprawki:",
     moveError: "Nie udało się przesunąć dedykacji:",
+    // Voice-over: stan przygotowania klipu lektora (PLAN.md, sekcja 8).
+    voiceOver: {
+      generating: "Generuję voice-over…",
+      ready: "Voice-over gotowy",
+      failed: "Nie udało się przygotować voice-overu:",
+      missing: "Voice-over nieprzygotowany",
+      generate: "Przygotuj voice-over",
+      retry: "Spróbuj ponownie",
+      unavailable: "Lektor niedostępny — przeczytaj dedykację z ekranu.",
+      generateError: "Nie udało się zamówić voice-overu:",
+      percentSuffix: "%",
+    },
     // Podpisy statusów prośby — pokazujemy je słowem, nie kodem.
     statuses: {
       submitted: "Czeka na przegląd",

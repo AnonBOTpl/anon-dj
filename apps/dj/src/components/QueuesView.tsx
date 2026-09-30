@@ -6,10 +6,13 @@ import { ArrowDown, ArrowUp, Ban, Check } from "lucide-react";
 import { Panel } from "./Panel";
 import { RequestCard } from "./RequestCard";
 import { ui } from "../text";
-import type { AppSettings, QueuedRequest, RequestStatus } from "../types";
+import type { AppSettings, ClipProgress, QueuedRequest, RequestStatus, VoiceOverState } from "../types";
 
 /** Zdarzenie o zmianie kolejki — musi zgadzać się ze stałą `EVENT_REQUESTS_CHANGED` w warstwie Rust. */
 const EVENT_REQUESTS_CHANGED = "requests://changed";
+
+/** Zdarzenie z postępem generowania voice-overu — `EVENT_CLIP_PROGRESS` w warstwie Rust. */
+const EVENT_CLIP_PROGRESS = "clips://progress";
 
 /** Limit dedykacji z protokołu — używany tylko do czasu wczytania ustawień DJ-a. */
 const FALLBACK_DEDICATION_CHARS = 400;
@@ -58,6 +61,8 @@ export function QueuesView() {
   const [maxChars, setMaxChars] = useState(FALLBACK_DEDICATION_CHARS);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [clipStates, setClipStates] = useState<Record<number, ClipProgress>>({});
+  const [ttsAvailable, setTtsAvailable] = useState(false);
 
   const refresh = useCallback(async () => {
     const [review, ready, history] = await Promise.all([
@@ -101,6 +106,75 @@ export function QueuesView() {
     };
   }, [refresh]);
 
+  // Stan voice-overów: raz na wejściu — dzięki temu po przeładowaniu okna widać generowanie,
+  // które już trwa — a potem zdarzeniami z warstwy Rust (status i pasek postępu).
+  useEffect(() => {
+    let active = true;
+
+    invoke<ClipProgress[]>("clip_states")
+      .then((states) => {
+        if (!active) {
+          return;
+        }
+
+        const known: Record<number, ClipProgress> = {};
+
+        for (const state of states) {
+          known[state.request_id] = state;
+        }
+
+        setClipStates(known);
+      })
+      .catch(() => {
+        // Brak stanów to nie błąd — karty pokażą „Przygotuj voice-over”.
+      });
+
+    invoke<{ available: boolean }>("tts_status")
+      .then((status) => {
+        if (active) {
+          setTtsAvailable(status.available);
+        }
+      })
+      .catch(() => {
+        // Bez informacji o lektorze nie pokazujemy przycisku, żeby nie obiecywać dźwięku.
+      });
+
+    const unlisten = listen<ClipProgress>(EVENT_CLIP_PROGRESS, (event) => {
+      const progress = event.payload;
+
+      setClipStates((current) => ({ ...current, [progress.request_id]: progress }));
+    });
+
+    return () => {
+      active = false;
+      void unlisten.then((stop) => stop());
+    };
+  }, []);
+
+  /**
+   * Stan voice-overu karty. Bieżący przebieg generowania wygrywa ze ścieżką klipu, bo po poprawce
+   * tekstu klip z bazy jest już nieaktualny, a nowy jeszcze się liczy.
+   */
+  function voiceOverFor(request: QueuedRequest): VoiceOverState {
+    const clip = clipStates[request.id];
+
+    if (clip !== undefined) {
+      if (clip.status === "generating") {
+        return { status: "generating", progress: clip.progress };
+      }
+
+      if (clip.status === "failed") {
+        return { status: "failed", message: clip.message };
+      }
+
+      if (clip.status === "ready") {
+        return { status: "ready" };
+      }
+    }
+
+    return request.tts_clip_path === null ? { status: "missing" } : { status: "ready" };
+  }
+
   /**
    * Jedna droga dla wszystkich decyzji DJ-a: wywołanie komendy, komunikat błędu i odświeżenie.
    * Zwraca `true`, gdy operacja się udała — karta edycji wie dzięki temu, czy zamknąć pole tekstu.
@@ -141,6 +215,14 @@ export function QueuesView() {
                   request={request}
                   maxChars={maxChars}
                   disabled={busy}
+                  voiceOver={voiceOverFor(request)}
+                  ttsAvailable={ttsAvailable}
+                  onGenerateVoiceOver={() =>
+                    void run(
+                      () => invoke("generate_clip", { request_id: request.id }),
+                      ui.queue.voiceOver.generateError,
+                    )
+                  }
                   onSaveDedication={(dedication) =>
                     run(
                       () => invoke("update_dedication", { request_id: request.id, dedication }),
@@ -191,6 +273,14 @@ export function QueuesView() {
                     request={request}
                     maxChars={maxChars}
                     disabled={busy}
+                    voiceOver={voiceOverFor(request)}
+                    ttsAvailable={ttsAvailable}
+                    onGenerateVoiceOver={() =>
+                      void run(
+                        () => invoke("generate_clip", { request_id: request.id }),
+                        ui.queue.voiceOver.generateError,
+                      )
+                    }
                     onSaveDedication={(dedication) =>
                       run(
                         () => invoke("update_dedication", { request_id: request.id, dedication }),

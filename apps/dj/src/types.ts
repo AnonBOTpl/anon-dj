@@ -19,7 +19,29 @@ export type QueuedRequest = {
   created_at: number;
   /** Czas ostatniej zmiany — po nim sortowana jest historia. */
   updated_at: number;
+  /** Ścieżka gotowego klipu lektora; `null`, dopóki voice-over nie jest policzony. */
+  tts_clip_path: string | null;
 };
+
+/** Stan klipu lektora raportowany przez warstwę Rust — `ClipStatus` w `src-tauri/src/clips.rs`. */
+export type ClipStatus = "generating" | "ready" | "failed";
+
+/** Postęp generowania klipu lektora — `ClipProgress` w `src-tauri/src/clips.rs`. */
+export type ClipProgress = {
+  request_id: number;
+  status: ClipStatus;
+  /** Postęp syntezy w procentach (0–100). */
+  progress: number;
+  /** Powód niepowodzenia; `null`, gdy wszystko poszło dobrze. */
+  message: string | null;
+};
+
+/** Stan voice-overu widziany przez kartę prośby — policzony, w toku, nieudany albo brak. */
+export type VoiceOverState =
+  | { status: "missing" }
+  | { status: "generating"; progress: number }
+  | { status: "ready" }
+  | { status: "failed"; message: string | null };
 
 /** Limity tekstów ustawione przez DJ-a — zgadzają się z typem `Limits` w `crate protocol`. */
 export type Limits = {
