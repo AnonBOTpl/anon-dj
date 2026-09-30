@@ -1,0 +1,23 @@
+[package]
+name = "kiosk"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+description = "ANON DJ — kiosk dla gości (wyszukiwanie utworu i dedykacja)"
+
+[lib]
+# Sufiks `_lib` jest konieczny, żeby nazwa biblioteki nie kolidowała z nazwą binarki
+# (problem dotyczy tylko Windows): https://github.com/rust-lang/cargo/issues/8519
+name = "kiosk_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+protocol.workspace = true
+serde.workspace = true
+tracing.workspace = true
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }

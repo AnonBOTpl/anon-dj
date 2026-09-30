@@ -1,0 +1,8 @@
+# Katalog wynikowy workspace'u (jeden wspólny dla wszystkich crate'ów).
+/target
+
+# Katalog roboczy: próbki TTS, modele, venv, logi prób — nigdy nie trafia do repozytorium.
+/.tmp
+
+# Logi uruchomieniowe.
+*.log

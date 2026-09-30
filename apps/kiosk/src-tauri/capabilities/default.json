@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "Minimalne uprawnienia okna kiosku — gość nie ma kontroli nad oknem",
+  "windows": ["main"],
+  "permissions": ["core:default"]
+}

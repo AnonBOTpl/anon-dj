@@ -1,0 +1,32 @@
+@import "tailwindcss";
+
+/* Motyw DJ-a: ciemny, gęsty, czytelny w słabym świetle na imprezie. */
+@theme {
+  --color-scena-950: #08090c;
+  --color-scena-900: #0e1016;
+  --color-scena-800: #171a22;
+  --color-scena-700: #23262f;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  /* Okno jest bez ramki — przewijamy tylko wewnątrz paneli. */
+  overflow: hidden;
+  background-color: var(--color-scena-950);
+  color: #e7e9ee;
+  font-family:
+    "Segoe UI",
+    system-ui,
+    sans-serif;
+}
+
+/* Chrom aplikacji nie zaznacza się tekstem; dedykacja dostaje osobny styl. */
+.app-chrome {
+  user-select: none;
+}

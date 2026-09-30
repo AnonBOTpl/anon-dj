@@ -1,0 +1,12 @@
+[package]
+name = "protocol"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+description = "ANON DJ — wspólne typy wiadomości dla aplikacji DJ-a i kiosku"
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true

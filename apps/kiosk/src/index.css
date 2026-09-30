@@ -1,0 +1,30 @@
+@import "tailwindcss";
+
+/* Kiosk dzieli wygląd z aplikacją DJ-a, ale jest większy i spokojniejszy — gość ma trafić za pierwszym razem. */
+@theme {
+  --color-scena-950: #08090c;
+  --color-scena-900: #0e1016;
+  --color-scena-800: #171a22;
+  --color-scena-700: #23262f;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  overflow: hidden;
+  background-color: var(--color-scena-950);
+  color: #e7e9ee;
+  font-family:
+    "Segoe UI",
+    system-ui,
+    sans-serif;
+}
+
+* {
+  user-select: none;
+}
