@@ -27,8 +27,15 @@ use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::error::Error as WsError;
 use tracing::{debug, info, warn};
 
-use crate::db::{Db, DbError, now_ms};
+use crate::db::{Db, DbError, RequestTarget, now_ms};
 use crate::settings::AppSettings;
+
+/// Połówka wysyłająca połączenia. Wysyłka i odbiór idą osobno, bo serwer musi umieć odezwać się
+/// do kiosku także wtedy, gdy ten nic nie pisze — na przykład gdy DJ zatwierdzi dedykację.
+type WsSink = futures_util::stream::SplitSink<WebSocketStream<TcpStream>, Message>;
+
+/// Połówka odbiorcza połączenia.
+type WsStream = futures_util::stream::SplitStream<WebSocketStream<TcpStream>>;
 
 /// Nazwa serwera pokazywana kioskowi przy parowaniu.
 const SERVER_NAME: &str = "ANON DJ";
@@ -73,6 +80,13 @@ pub struct Server {
 struct State {
     /// Podłączone kioski: identyfikator → nazwa.
     kiosks: HashMap<i64, String>,
+    /// Sposób odzywania się do podłączonego kiosku (identyfikator → kanał wysyłkowy).
+    outboxes: HashMap<i64, mpsc::UnboundedSender<DjMessage>>,
+    /// Numer bieżącego połączenia każdego kiosku. Rośnie z każdym połączeniem; dzięki niemu
+    /// kończące się stare połączenie nie wyrejestruje przypadkiem nowego.
+    sessions: HashMap<i64, u64>,
+    /// Licznik numerów połączeń.
+    next_session: u64,
     limiter: RateLimiter,
     /// Czy nasłuch faktycznie działa. Zajęty port to najczęstsza przyczyna „kiosk się nie łączy”,
     /// więc DJ musi to widzieć w interfejsie, a nie tylko w logu.
@@ -121,6 +135,52 @@ impl Server {
                 names
             }
             Err(_) => Vec::new(),
+        }
+    }
+
+    /// Mówi interfejsowi DJ-a, że zmieniła się kolejka prośb.
+    pub fn notify_queue_changed(&self) {
+        self.emit(UiEvent::RequestsChanged);
+    }
+
+    /// Przekazuje kioskowi zmianę statusu jego prośby. Kiosk, który zdążył się rozłączyć,
+    /// nie jest błędem — informacja zostaje w aplikacji DJ-a.
+    pub fn notify_request_status(&self, target: RequestTarget, status: RequestStatus) {
+        let (Some(kiosk_id), Some(request_id)) = (target.kiosk_id, target.kiosk_request_id) else {
+            return;
+        };
+
+        let mut state = match self.state.lock() {
+            Ok(state) => state,
+            Err(_) => return,
+        };
+
+        // Zniknięty kanał oznacza rozłączenie w trakcie wysyłki — czyścimy po nim wpis.
+        let delivered = match state.outboxes.get(&kiosk_id) {
+            Some(outbox) => outbox
+                .send(DjMessage::RequestStatus { request_id, status })
+                .is_ok(),
+            None => false,
+        };
+
+        // Ślad w dzienniku jest tu potrzebny: na jego podstawie DJ sprawdza, czy kiosk
+        // w ogóle dowiedział się o decyzji. Sukces logujemy na `info`, bo to zmiana stanu,
+        // a porażkę na `warn` — przy domyślnym filtrze `info` `debug` byłby niewidoczny.
+        if delivered {
+            info!(
+                kiosk_id,
+                request_id,
+                status = status.as_str(),
+                "status prośby przekazany kioskowi"
+            );
+        } else {
+            state.outboxes.remove(&kiosk_id);
+            warn!(
+                kiosk_id,
+                request_id,
+                status = status.as_str(),
+                "kiosk nie odebrał zmiany statusu"
+            );
         }
     }
 
@@ -227,48 +287,69 @@ impl Server {
     }
 
     /// Pętla jednego kiosku: najpierw parowanie, potem komunikaty.
-    async fn handle_connection(&self, mut ws: WebSocketStream<TcpStream>, peer: SocketAddr) {
-        let Some((kiosk_id, name)) = self.pair(&mut ws, peer).await else {
+    async fn handle_connection(&self, ws: WebSocketStream<TcpStream>, peer: SocketAddr) {
+        let (mut sink, mut stream) = ws.split();
+
+        let Some((kiosk_id, name)) = self.pair(&mut sink, &mut stream, peer).await else {
             return;
         };
 
-        self.mark_connected(kiosk_id, name.clone());
+        // Kanał wysyłkowy trafia do stanu serwera — to jedyny sposób, żeby zmiana statusu prośby
+        // w interfejsie DJ-a dotarła do kiosku, który akurat nic nie pisze.
+        let (outbox, mut outgoing) = mpsc::unbounded_channel();
+        let session = self.mark_connected(kiosk_id, name.clone(), outbox);
 
-        while let Some(incoming) = ws.next().await {
-            match incoming {
-                Ok(Message::Text(text)) => {
-                    if !self.handle_message(kiosk_id, text.as_str(), &mut ws).await {
-                        break;
+        loop {
+            tokio::select! {
+                incoming = stream.next() => {
+                    match incoming {
+                        Some(Ok(Message::Text(text))) => {
+                            if !self.handle_message(kiosk_id, text.as_str(), &mut sink).await {
+                                break;
+                            }
+                        }
+                        Some(Ok(Message::Close(_))) | None => break,
+                        // Ping/pong obsługuje biblioteka, binarne komunikaty nie należą do protokołu.
+                        Some(Ok(_)) => {}
+                        Some(Err(error)) => {
+                            debug!(peer = %peer, error = %error, "błąd odczytu od kiosku");
+
+                            break;
+                        }
                     }
                 }
-                Ok(Message::Close(_)) => break,
-                // Ping/pong obsługuje biblioteka, binarne komunikaty nie należą do protokołu.
-                Ok(_) => {}
-                Err(error) => {
-                    debug!(peer = %peer, error = %error, "błąd odczytu od kiosku");
-
-                    break;
+                message = outgoing.recv() => {
+                    match message {
+                        Some(message) => {
+                            if !send(&mut sink, &message).await {
+                                break;
+                            }
+                        }
+                        // Kanał zamknięty = nowe połączenie tego kiosku albo rozłączenie.
+                        None => break,
+                    }
                 }
             }
         }
 
-        self.mark_disconnected(kiosk_id);
+        self.mark_disconnected(kiosk_id, session);
     }
 
     /// Czeka na `hello` i sprawdza PIN. `None` oznacza, że połączenie zostało odrzucone.
     async fn pair(
         &self,
-        ws: &mut WebSocketStream<TcpStream>,
+        sink: &mut WsSink,
+        stream: &mut WsStream,
         peer: SocketAddr,
     ) -> Option<(i64, String)> {
         let limits = self.limits();
 
-        let text = match tokio::time::timeout(PAIRING_TIMEOUT, ws.next()).await {
+        let text = match tokio::time::timeout(PAIRING_TIMEOUT, stream.next()).await {
             Ok(Some(Ok(Message::Text(text)))) => text,
             Ok(Some(Ok(_))) => {
                 warn!(peer = %peer, "pierwszy komunikat kiosku nie jest tekstem");
 
-                self.reject(ws, ErrorCode::InvalidMessage).await;
+                self.reject(sink, ErrorCode::InvalidMessage).await;
 
                 return None;
             }
@@ -281,7 +362,7 @@ impl Server {
             Err(_) => {
                 warn!(peer = %peer, "kiosk nie przysłał hello w wyznaczonym czasie");
 
-                self.reject(ws, ErrorCode::InvalidMessage).await;
+                self.reject(sink, ErrorCode::InvalidMessage).await;
 
                 return None;
             }
@@ -292,7 +373,7 @@ impl Server {
             Err(error) => {
                 warn!(peer = %peer, error = %error, "nieczytelny komunikat parowania");
 
-                self.reject(ws, ErrorCode::InvalidMessage).await;
+                self.reject(sink, ErrorCode::InvalidMessage).await;
 
                 return None;
             }
@@ -302,7 +383,7 @@ impl Server {
         if let Err(error) = message.validate_with(&limits) {
             warn!(peer = %peer, error = %error, "parowanie odrzucone przez walidację");
 
-            self.reject(ws, ErrorCode::InvalidRequest).await;
+            self.reject(sink, ErrorCode::InvalidRequest).await;
 
             return None;
         }
@@ -313,7 +394,7 @@ impl Server {
         else {
             warn!(peer = %peer, "pierwszy komunikat kiosku to nie hello");
 
-            self.reject(ws, ErrorCode::InvalidMessage).await;
+            self.reject(sink, ErrorCode::InvalidMessage).await;
 
             return None;
         };
@@ -321,7 +402,7 @@ impl Server {
         if !self.pin_matches(&pin) {
             warn!(peer = %peer, "kiosk podał nieprawidłowy PIN");
 
-            self.reject(ws, ErrorCode::Unauthorized).await;
+            self.reject(sink, ErrorCode::Unauthorized).await;
 
             return None;
         }
@@ -331,7 +412,7 @@ impl Server {
             _ => {
                 warn!(peer = %peer, "kiosk przysłał pustą albo dziwną nazwę");
 
-                self.reject(ws, ErrorCode::InvalidRequest).await;
+                self.reject(sink, ErrorCode::InvalidRequest).await;
 
                 return None;
             }
@@ -349,7 +430,7 @@ impl Server {
             Err(error) => {
                 warn!(peer = %peer, error = %error, "nie udało się zapisać kiosku");
 
-                self.reject(ws, ErrorCode::Internal).await;
+                self.reject(sink, ErrorCode::Internal).await;
 
                 return None;
             }
@@ -363,7 +444,7 @@ impl Server {
             confirmation_seconds: self.confirmation_seconds(),
         };
 
-        if !send(ws, &hello_ok).await {
+        if !send(sink, &hello_ok).await {
             return None;
         }
 
@@ -373,12 +454,7 @@ impl Server {
     }
 
     /// Obsługuje jeden komunikat po parowaniu. Zwraca `false`, gdy trzeba zamknąć połączenie.
-    async fn handle_message(
-        &self,
-        kiosk_id: i64,
-        raw: &str,
-        ws: &mut WebSocketStream<TcpStream>,
-    ) -> bool {
+    async fn handle_message(&self, kiosk_id: i64, raw: &str, sink: &mut WsSink) -> bool {
         let message = match KioskMessage::from_json(raw) {
             Ok(message) => message,
             Err(error) => {
@@ -386,7 +462,7 @@ impl Server {
                 // dalej udawać, że rozmowa ma sens.
                 warn!(kiosk_id, error = %error, "nieczytelny komunikat od kiosku");
 
-                send(ws, &error_message(None, ErrorCode::InvalidMessage)).await;
+                send(sink, &error_message(None, ErrorCode::InvalidMessage)).await;
 
                 return false;
             }
@@ -398,7 +474,7 @@ impl Server {
             debug!(kiosk_id, error = %error, "komunikat odrzucony przez walidację");
 
             send(
-                ws,
+                sink,
                 &error_message(message.request_id(), ErrorCode::InvalidRequest),
             )
             .await;
@@ -410,7 +486,7 @@ impl Server {
             warn!(kiosk_id, "kiosk przekroczył limit tempa");
 
             send(
-                ws,
+                sink,
                 &error_message(message.request_id(), ErrorCode::RateLimited),
             )
             .await;
@@ -421,12 +497,12 @@ impl Server {
         match message {
             // Drugie hello w tym samym połączeniu to błąd protokołu: kiosk jest już sparowany.
             KioskMessage::Hello { .. } => {
-                send(ws, &error_message(None, ErrorCode::InvalidMessage)).await;
+                send(sink, &error_message(None, ErrorCode::InvalidMessage)).await;
 
                 false
             }
             KioskMessage::Search { request_id, query } => {
-                self.handle_search(request_id, &query, ws).await;
+                self.handle_search(request_id, &query, sink).await;
 
                 true
             }
@@ -442,7 +518,7 @@ impl Server {
                     track_id,
                     &dedication,
                     guest_name.as_deref(),
-                    ws,
+                    sink,
                 )
                 .await;
 
@@ -452,18 +528,13 @@ impl Server {
     }
 
     /// Wyszukiwanie w bibliotece DJ-a na prośbę gościa.
-    async fn handle_search(
-        &self,
-        request_id: u64,
-        query: &str,
-        ws: &mut WebSocketStream<TcpStream>,
-    ) {
+    async fn handle_search(&self, request_id: u64, query: &str, sink: &mut WsSink) {
         // Zapytanie jest już znormalizowane przez walidację komunikatów.
         let query = match normalize_text(query) {
             Ok(query) if !query.is_empty() => query,
             _ => {
                 send(
-                    ws,
+                    sink,
                     &error_message(Some(request_id), ErrorCode::InvalidRequest),
                 )
                 .await;
@@ -485,12 +556,12 @@ impl Server {
 
                 let results = DjMessage::SearchResults { request_id, tracks };
 
-                send(ws, &results).await;
+                send(sink, &results).await;
             }
             Err(error) => {
                 warn!(request_id, error = %error, "wyszukiwanie dla kiosku nie powiodło się");
 
-                send(ws, &error_message(Some(request_id), ErrorCode::Internal)).await;
+                send(sink, &error_message(Some(request_id), ErrorCode::Internal)).await;
             }
         }
     }
@@ -503,7 +574,7 @@ impl Server {
         track_id: i64,
         dedication: &str,
         guest_name: Option<&str>,
-        ws: &mut WebSocketStream<TcpStream>,
+        sink: &mut WsSink,
     ) {
         let limits = self.limits();
 
@@ -514,7 +585,7 @@ impl Server {
                     debug!(kiosk_id, error = %error, "dedykacja odrzucona");
 
                     send(
-                        ws,
+                        sink,
                         &error_message(Some(request_id), ErrorCode::InvalidRequest),
                     )
                     .await;
@@ -532,7 +603,7 @@ impl Server {
                 debug!(kiosk_id, error = %error, "imię gościa odrzucone");
 
                 send(
-                    ws,
+                    sink,
                     &error_message(Some(request_id), ErrorCode::InvalidRequest),
                 )
                 .await;
@@ -559,7 +630,7 @@ impl Server {
                 );
 
                 send(
-                    ws,
+                    sink,
                     &error_message(Some(request_id), ErrorCode::InvalidRequest),
                 )
                 .await;
@@ -569,7 +640,7 @@ impl Server {
             Err(error) => {
                 warn!(kiosk_id, error = %error, "nie udało się sprawdzić utworu");
 
-                send(ws, &error_message(Some(request_id), ErrorCode::Internal)).await;
+                send(sink, &error_message(Some(request_id), ErrorCode::Internal)).await;
 
                 return;
             }
@@ -588,7 +659,7 @@ impl Server {
             Err(error) => {
                 warn!(kiosk_id, error = %error, "nie udało się sprawdzić duplikatu");
 
-                send(ws, &error_message(Some(request_id), ErrorCode::Internal)).await;
+                send(sink, &error_message(Some(request_id), ErrorCode::Internal)).await;
 
                 return;
             }
@@ -598,7 +669,7 @@ impl Server {
             debug!(kiosk_id, track_id, "duplikat prośby odrzucony");
 
             send(
-                ws,
+                sink,
                 &error_message(Some(request_id), ErrorCode::DuplicateRequest),
             )
             .await;
@@ -611,7 +682,15 @@ impl Server {
             let dedication = dedication.clone();
             let guest_name = guest_name.clone();
 
-            move || db.insert_request(track_id, &dedication, guest_name.as_deref(), Some(kiosk_id))
+            move || {
+                db.insert_request(
+                    track_id,
+                    &dedication,
+                    guest_name.as_deref(),
+                    Some(kiosk_id),
+                    Some(request_id),
+                )
+            }
         })
         .await;
 
@@ -625,7 +704,7 @@ impl Server {
                 );
 
                 send(
-                    ws,
+                    sink,
                     &DjMessage::RequestReceived {
                         request_id,
                         status: RequestStatus::Submitted,
@@ -633,21 +712,21 @@ impl Server {
                 )
                 .await;
 
-                self.emit(UiEvent::RequestsChanged);
+                self.notify_queue_changed();
             }
             Err(error) => {
                 warn!(kiosk_id, error = %error, "nie udało się zapisać prośby");
 
-                send(ws, &error_message(Some(request_id), ErrorCode::Internal)).await;
+                send(sink, &error_message(Some(request_id), ErrorCode::Internal)).await;
             }
         }
     }
 
     /// Zamyka połączenie po wysłaniu kioskowi kodu błędu.
-    async fn reject(&self, ws: &mut WebSocketStream<TcpStream>, code: ErrorCode) {
-        send(ws, &error_message(None, code)).await;
+    async fn reject(&self, sink: &mut WsSink, code: ErrorCode) {
+        send(sink, &error_message(None, code)).await;
 
-        if let Err(error) = ws.close(None).await {
+        if let Err(error) = sink.close().await {
             debug!(error = %error, "nie udało się zamknąć odrzuconego połączenia");
         }
     }
@@ -670,21 +749,47 @@ impl Server {
         }
     }
 
-    fn mark_connected(&self, kiosk_id: i64, name: String) {
-        match self.state.lock() {
+    /// Rejestruje kiosk razem z kanałem, którym można się do niego odezwać bez pytania.
+    ///
+    /// Zwraca numer tego połączenia. Kiosk, który łączy się ponownie, dostaje nowy numer,
+    /// a stare połączenie kończy się samo, gdy tylko zauważy zamknięty kanał.
+    fn mark_connected(
+        &self,
+        kiosk_id: i64,
+        name: String,
+        outbox: mpsc::UnboundedSender<DjMessage>,
+    ) -> u64 {
+        let session = match self.state.lock() {
             Ok(mut state) => {
+                state.next_session += 1;
+                let session = state.next_session;
+
                 state.kiosks.insert(kiosk_id, name);
+                state.outboxes.insert(kiosk_id, outbox);
+                state.sessions.insert(kiosk_id, session);
+
+                session
             }
-            Err(_) => return,
+            Err(_) => 0,
         };
 
         self.emit(UiEvent::KiosksChanged);
+
+        session
     }
 
-    fn mark_disconnected(&self, kiosk_id: i64) {
+    /// Wyrejestrowuje kiosk — ale tylko wtedy, gdy to wciąż to samo połączenie. Kiosk mógł się
+    /// już połączyć ponownie, zanim stary wątek zdążył posprzątać po sobie.
+    fn mark_disconnected(&self, kiosk_id: i64, session: u64) {
         match self.state.lock() {
             Ok(mut state) => {
+                if state.sessions.get(&kiosk_id) != Some(&session) {
+                    return;
+                }
+
+                state.sessions.remove(&kiosk_id);
                 state.kiosks.remove(&kiosk_id);
+                state.outboxes.remove(&kiosk_id);
                 // Historia tempa nie jest już potrzebna — kiosk przyjdzie od nowa.
                 state.limiter.forget(kiosk_id);
             }
@@ -1014,6 +1119,88 @@ mod tests {
         assert_eq!(queue[0].title, "Słodkiego, miłego życia");
 
         assert_eq!(server.connected_kiosks(), vec!["Kiosk testowy".to_string()]);
+
+        // 5. Decyzja DJ-a dociera do kiosku, choć ten akurat o nic nie pytał.
+        let request = queue[0].id;
+        db.approve_request(request).expect("zatwierdzenie");
+
+        let target = db
+            .request_target(request)
+            .expect("adres prośby")
+            .expect("prośba istnieje");
+
+        server.notify_request_status(target, RequestStatus::Approved);
+
+        assert!(
+            matches!(
+                next_message(&mut ws).await,
+                Some(DjMessage::RequestStatus {
+                    request_id: 2,
+                    status: RequestStatus::Approved
+                })
+            ),
+            "kiosk dostaje status prośby, którą sam oznaczył numerem 2"
+        );
+    }
+
+    #[test]
+    fn a_status_change_without_a_connected_kiosk_is_harmless() {
+        let db = Arc::new(Db::open_in_memory().expect("baza w pamięci"));
+        let settings = Arc::new(Mutex::new(AppSettings::default()));
+        let (events, _receiver) = mpsc::unbounded_channel();
+        let server = Server::new(db, settings, events, free_port());
+
+        // Kiosk rozłączył się przed decyzją DJ-a — nie ma komu wysyłać i nie jest to błąd.
+        server.notify_request_status(
+            RequestTarget {
+                kiosk_id: Some(7),
+                kiosk_request_id: Some(1),
+            },
+            RequestStatus::Approved,
+        );
+        server.notify_request_status(
+            RequestTarget {
+                kiosk_id: None,
+                kiosk_request_id: None,
+            },
+            RequestStatus::Rejected,
+        );
+    }
+
+    #[test]
+    fn a_stale_connection_cannot_unregister_the_new_one() {
+        let db = Arc::new(Db::open_in_memory().expect("baza w pamięci"));
+        let settings = Arc::new(Mutex::new(AppSettings::default()));
+        let (events, _receiver) = mpsc::unbounded_channel();
+        let server = Server::new(db, settings, events, free_port());
+
+        let (stale_outbox, _stale_receiver) = mpsc::unbounded_channel();
+        let stale_session = server.mark_connected(1, "Kiosk".to_string(), stale_outbox);
+
+        // Kiosk łączy się ponownie, zanim stary wątek zdąży zauważyć rozłączenie.
+        let (outbox, mut receiver) = mpsc::unbounded_channel();
+        server.mark_connected(1, "Kiosk".to_string(), outbox);
+
+        server.mark_disconnected(1, stale_session);
+
+        assert_eq!(
+            server.connected_kiosks(),
+            vec!["Kiosk".to_string()],
+            "stare połączenie nie może wyrejestrować nowego"
+        );
+
+        server.notify_request_status(
+            RequestTarget {
+                kiosk_id: Some(1),
+                kiosk_request_id: Some(7),
+            },
+            RequestStatus::Approved,
+        );
+
+        assert!(
+            receiver.try_recv().is_ok(),
+            "status musi trafić kanałem nowego połączenia"
+        );
     }
 
     #[tokio::test]

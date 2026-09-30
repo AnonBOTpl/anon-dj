@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState, type ReactNode } from "react";
+import { useEffect, useState, type ReactNode } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { motion } from "framer-motion";
@@ -14,8 +14,7 @@ import {
 } from "lucide-react";
 
 import { LibraryView } from "./components/LibraryView";
-import { Panel } from "./components/Panel";
-import { RequestList, type QueuedRequest } from "./components/RequestList";
+import { QueuesView } from "./components/QueuesView";
 import { SettingsView } from "./components/SettingsView";
 import { TitleBar } from "./components/TitleBar";
 import { ui } from "./text";
@@ -37,8 +36,6 @@ type ServerStatus = {
   kiosks: string[];
 };
 
-/** Zdarzenie o zmianie kolejki prośb. */
-const EVENT_REQUESTS_CHANGED = "requests://changed";
 /** Zdarzenie o zmianie stanu serwera kiosków. */
 const EVENT_KIOSK_STATUS = "kiosk://status";
 
@@ -108,15 +105,8 @@ function NavButton({
 export default function App() {
   const [status, setStatus] = useState<AppStatus | null>(null);
   const [server, setServer] = useState<ServerStatus | null>(null);
-  const [requests, setRequests] = useState<QueuedRequest[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [view, setView] = useState<View>("queues");
-
-  const refreshRequests = useCallback(async () => {
-    const pending = await invoke<QueuedRequest[]>("pending_requests");
-
-    setRequests(pending);
-  }, []);
 
   // Serwer kiosków melduje się zdarzeniem; na starcie pytamy o stan raz, żeby pasek statusu
   // nie czekał na pierwsze połączenie.
@@ -144,23 +134,6 @@ export default function App() {
       void unlisten.then((stop) => stop());
     };
   }, []);
-
-  // Kolejka prośb: raz na start i po każdym zgłoszeniu gościa.
-  useEffect(() => {
-    void refreshRequests().catch((reason: unknown) => {
-      setError(`${ui.requests.loadError} ${String(reason)}`);
-    });
-
-    const unlisten = listen(EVENT_REQUESTS_CHANGED, () => {
-      void refreshRequests().catch((reason: unknown) => {
-        setError(`${ui.requests.loadError} ${String(reason)}`);
-      });
-    });
-
-    return () => {
-      void unlisten.then((stop) => stop());
-    };
-  }, [refreshRequests]);
 
   useEffect(() => {
     let active = true;
@@ -249,30 +222,7 @@ export default function App() {
       </section>
 
       <main className="min-h-0 flex-1 overflow-y-auto p-3">
-        {view === "queues" && (
-          <div className="grid h-full min-h-0 grid-cols-[1.5fr_1fr] gap-3">
-            <Panel
-              title={ui.queue.reviewTitle}
-              hint={ui.queue.reviewHint}
-              empty={ui.queue.reviewEmpty}
-            >
-              {requests.length > 0 ? <RequestList requests={requests} /> : undefined}
-            </Panel>
-
-            <div className="grid min-h-0 grid-rows-2 gap-3">
-              <Panel
-                title={ui.queue.readyTitle}
-                hint={ui.queue.readyHint}
-                empty={ui.queue.readyEmpty}
-              />
-              <Panel
-                title={ui.queue.historyTitle}
-                hint={ui.queue.historyHint}
-                empty={ui.queue.historyEmpty}
-              />
-            </div>
-          </div>
-        )}
+        {view === "queues" && <QueuesView />}
 
         {view === "library" && <LibraryView />}
 

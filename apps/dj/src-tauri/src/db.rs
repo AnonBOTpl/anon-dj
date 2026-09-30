@@ -15,6 +15,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 const MIGRATIONS: &[&str] = &[
     include_str!("../migrations/0001_initial.sql"),
     include_str!("../migrations/0002_library.sql"),
+    include_str!("../migrations/0003_review_queue.sql"),
 ];
 
 /// Błąd warstwy bazy danych.
@@ -34,6 +35,23 @@ pub enum DbError {
 
     #[error("nieznany status prośby zapisany w bazie: {0}")]
     UnknownStatus(String),
+
+    #[error("prośba {0} nie istnieje")]
+    RequestNotFound(i64),
+
+    #[error("nie można zmienić statusu prośby {id} z „{from}” na „{to}”")]
+    InvalidTransition {
+        id: i64,
+        from: &'static str,
+        to: &'static str,
+    },
+}
+
+/// Dokąd wysłać informację o zmianie statusu prośby: który kiosk ją przysłał i jak ją nazwał.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RequestTarget {
+    pub kiosk_id: Option<i64>,
+    pub kiosk_request_id: Option<u64>,
 }
 
 /// Baza SQLite aplikacji DJ-a. Jedno połączenie pod mutexem — operacje są krótkie,
@@ -281,26 +299,33 @@ impl Db {
 
     /// Zapisuje prośbę gościa w kolejce przeglądu (status `submitted`).
     /// Zwraca identyfikator prośby i czas jej powstania.
+    ///
+    /// `kiosk_request_id` to identyfikator nadany przez kiosk — trzymamy go tylko po to, żeby
+    /// umieć powiedzieć temu kioskowi, co DJ zrobił z jego dedykacją.
     pub fn insert_request(
         &self,
         track_id: i64,
         dedication: &str,
         guest_name: Option<&str>,
         kiosk_id: Option<i64>,
+        kiosk_request_id: Option<u64>,
     ) -> Result<(i64, i64), DbError> {
         let conn = self.lock()?;
         let created_at = now_ms();
+        let kiosk_request_id = kiosk_request_id.and_then(|id| i64::try_from(id).ok());
 
         let id = conn.query_row(
             "INSERT INTO requests
-                 (track_id, dedication_original, guest_name, kiosk_id, status, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)
+                 (track_id, dedication_original, guest_name, kiosk_id, kiosk_request_id,
+                  status, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7)
              RETURNING id",
             params![
                 track_id,
                 dedication,
                 guest_name,
                 kiosk_id,
+                kiosk_request_id,
                 RequestStatus::Submitted.as_str(),
                 created_at
             ],
@@ -339,57 +364,301 @@ impl Db {
     ) -> Result<Vec<QueuedRequest>, DbError> {
         let conn = self.lock()?;
 
-        let mut statement = conn.prepare(
-            "SELECT r.id, r.track_id, t.title, t.artist,
-                    COALESCE(r.dedication_edited, r.dedication_original),
-                    r.guest_name, r.status, r.created_at
-             FROM requests r
-             JOIN tracks t ON t.id = r.track_id
-             WHERE r.status = ?1
-             ORDER BY r.created_at
-             LIMIT ?2",
-        )?;
+        query_requests(
+            &conn,
+            &format!(
+                "SELECT {QUEUE_COLUMNS} FROM requests r JOIN tracks t ON t.id = r.track_id
+                 WHERE r.status = ?1
+                 ORDER BY r.created_at
+                 LIMIT ?2"
+            ),
+            params![status.as_str(), limit],
+        )
+    }
 
-        let rows = statement.query_map(params![status.as_str(), limit], |row| {
-            Ok((
-                row.get::<_, i64>(0)?,
-                row.get::<_, i64>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, String>(3)?,
-                row.get::<_, String>(4)?,
-                row.get::<_, Option<String>>(5)?,
-                row.get::<_, String>(6)?,
-                row.get::<_, i64>(7)?,
-            ))
-        })?;
+    /// Kolejka „gotowe do wykonania” w kolejności ustalonej przez DJ-a.
+    pub fn ready_requests(&self, limit: u32) -> Result<Vec<QueuedRequest>, DbError> {
+        let conn = self.lock()?;
 
-        let mut requests = Vec::new();
+        query_requests(
+            &conn,
+            &format!(
+                "SELECT {QUEUE_COLUMNS} FROM requests r JOIN tracks t ON t.id = r.track_id
+                 WHERE r.status = ?1
+                 ORDER BY r.position, r.created_at
+                 LIMIT ?2"
+            ),
+            params![RequestStatus::Approved.as_str(), limit],
+        )
+    }
 
-        for row in rows {
-            let (id, track_id, title, artist, dedication, guest_name, stored_status, created_at) =
-                row?;
-            let status = RequestStatus::parse(&stored_status)
-                .ok_or(DbError::UnknownStatus(stored_status))?;
+    /// Historia: wykonane i odrzucone, ostatnio zmienione pierwsze.
+    pub fn request_history(&self, limit: u32) -> Result<Vec<QueuedRequest>, DbError> {
+        let conn = self.lock()?;
 
-            requests.push(QueuedRequest {
-                id,
-                track_id,
-                title,
-                artist,
-                dedication,
-                guest_name,
-                status,
-                created_at,
-            });
+        query_requests(
+            &conn,
+            &format!(
+                "SELECT {QUEUE_COLUMNS} FROM requests r JOIN tracks t ON t.id = r.track_id
+                 WHERE r.status IN (?1, ?2)
+                 ORDER BY r.updated_at DESC
+                 LIMIT ?3"
+            ),
+            params![
+                RequestStatus::Done.as_str(),
+                RequestStatus::Rejected.as_str(),
+                limit
+            ],
+        )
+    }
+
+    /// Zatwierdza prośbę z kolejki przeglądu i stawia ją na końcu kolejki gotowych.
+    ///
+    /// Zatwierdzić można wyłącznie prośbę czekającą na przegląd — ponowne zatwierdzenie
+    /// przesunęłoby ją na koniec kolejki, o co DJ nie prosił.
+    pub fn approve_request(&self, id: i64) -> Result<(), DbError> {
+        let conn = self.lock()?;
+
+        match current_status(&conn, id)? {
+            Some(RequestStatus::Submitted) => {}
+            Some(other) => return Err(invalid_transition(id, other, RequestStatus::Approved)),
+            None => return Err(DbError::RequestNotFound(id)),
         }
 
-        Ok(requests)
+        // Nowa prośba ląduje na końcu kolejki gotowych — DJ może ją potem przesunąć.
+        let position: i64 = conn.query_row(
+            "SELECT COALESCE(MAX(position), 0) + 1 FROM requests WHERE status = ?1",
+            params![RequestStatus::Approved.as_str()],
+            |row| row.get(0),
+        )?;
+
+        conn.execute(
+            "UPDATE requests SET status = ?2, position = ?3, updated_at = ?4 WHERE id = ?1",
+            params![id, RequestStatus::Approved.as_str(), position, now_ms()],
+        )?;
+
+        Ok(())
+    }
+
+    /// Odrzuca prośbę — zarówno czekającą na przegląd, jak i zatwierdzoną.
+    pub fn reject_request(&self, id: i64) -> Result<(), DbError> {
+        let conn = self.lock()?;
+
+        match current_status(&conn, id)? {
+            Some(RequestStatus::Submitted | RequestStatus::Approved) => {}
+            Some(other) => return Err(invalid_transition(id, other, RequestStatus::Rejected)),
+            None => return Err(DbError::RequestNotFound(id)),
+        }
+
+        conn.execute(
+            "UPDATE requests SET status = ?2, position = NULL, updated_at = ?3 WHERE id = ?1",
+            params![id, RequestStatus::Rejected.as_str(), now_ms()],
+        )?;
+
+        Ok(())
+    }
+
+    /// Zapisuje dedykację po edycji DJ-a. Tekst oryginalny zostaje w bazie — historia ma sens
+    /// tylko wtedy, gdy widać, co napisał gość (PLAN.md, sekcja 6).
+    pub fn set_dedication(&self, id: i64, dedication: &str) -> Result<(), DbError> {
+        let conn = self.lock()?;
+
+        let updated = conn.execute(
+            "UPDATE requests SET dedication_edited = ?2, updated_at = ?3 WHERE id = ?1",
+            params![id, dedication, now_ms()],
+        )?;
+
+        if updated == 0 {
+            return Err(DbError::RequestNotFound(id));
+        }
+
+        Ok(())
+    }
+
+    /// Przesuwa prośbę w kolejce gotowych o jedno miejsce. `false` oznacza, że nie ma dokąd —
+    /// prośba stoi już na początku albo na końcu.
+    pub fn move_request(&self, id: i64, up: bool) -> Result<bool, DbError> {
+        let mut conn = self.lock()?;
+
+        let position: Option<i64> = conn
+            .query_row(
+                "SELECT position FROM requests WHERE id = ?1 AND status = ?2",
+                params![id, RequestStatus::Approved.as_str()],
+                |row| row.get(0),
+            )
+            .optional()?;
+
+        let Some(position) = position else {
+            return Ok(false);
+        };
+
+        // Sąsiad to najbliższa prośba po właściwej stronie — z nią wymieniamy miejsca.
+        let neighbour = if up {
+            conn.query_row(
+                "SELECT id, position FROM requests
+                 WHERE status = ?1 AND position < ?2
+                 ORDER BY position DESC
+                 LIMIT 1",
+                params![RequestStatus::Approved.as_str(), position],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .optional()?
+        } else {
+            conn.query_row(
+                "SELECT id, position FROM requests
+                 WHERE status = ?1 AND position > ?2
+                 ORDER BY position ASC
+                 LIMIT 1",
+                params![RequestStatus::Approved.as_str(), position],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .optional()?
+        };
+
+        let Some((neighbour_id, neighbour_position)) = neighbour else {
+            return Ok(false);
+        };
+
+        // Zamiana miejsc musi być atomowa — inaczej przerwany zapis zostawiłby dwie prośby
+        // z tą samą pozycją.
+        let transaction = conn.transaction()?;
+        transaction.execute(
+            "UPDATE requests SET position = ?2 WHERE id = ?1",
+            params![id, neighbour_position],
+        )?;
+        transaction.execute(
+            "UPDATE requests SET position = ?2 WHERE id = ?1",
+            params![neighbour_id, position],
+        )?;
+        transaction.commit()?;
+
+        Ok(true)
+    }
+
+    /// Dokąd wysłać zmianę statusu prośby. `None` oznacza, że prośby nie ma w bazie.
+    pub fn request_target(&self, id: i64) -> Result<Option<RequestTarget>, DbError> {
+        let conn = self.lock()?;
+
+        let target = conn
+            .query_row(
+                "SELECT kiosk_id, kiosk_request_id FROM requests WHERE id = ?1",
+                params![id],
+                |row| {
+                    Ok(RequestTarget {
+                        kiosk_id: row.get(0)?,
+                        kiosk_request_id: row
+                            .get::<_, Option<i64>>(1)?
+                            .and_then(|value| u64::try_from(value).ok()),
+                    })
+                },
+            )
+            .optional()?;
+
+        Ok(target)
     }
 
     fn lock(&self) -> Result<std::sync::MutexGuard<'_, Connection>, DbError> {
         // Zatruty mutex oznacza panikę w innym wątku — traktujemy to jako błąd bazy,
         // nigdy nie panikujemy w kodzie aplikacji.
         self.conn.lock().map_err(|_| DbError::Poisoned)
+    }
+}
+
+/// Kolumny jednego wiersza kolejki — w jednym miejscu, żeby trzy kolejki nie rozjechały się
+/// z tabelami po cichu.
+const QUEUE_COLUMNS: &str = "r.id, r.track_id, t.title, t.artist,
+     COALESCE(r.dedication_edited, r.dedication_original), r.guest_name, r.status,
+     r.created_at, r.updated_at";
+
+/// Wiersz kolejki odczytany z bazy, jeszcze przed tłumaczeniem statusu.
+struct QueuedRequestRow {
+    id: i64,
+    track_id: i64,
+    title: String,
+    artist: String,
+    dedication: String,
+    guest_name: Option<String>,
+    status: String,
+    created_at: i64,
+    updated_at: i64,
+}
+
+impl TryFrom<QueuedRequestRow> for QueuedRequest {
+    type Error = DbError;
+
+    fn try_from(row: QueuedRequestRow) -> Result<Self, Self::Error> {
+        let status = RequestStatus::parse(&row.status)
+            .ok_or_else(|| DbError::UnknownStatus(row.status.clone()))?;
+
+        Ok(Self {
+            id: row.id,
+            track_id: row.track_id,
+            title: row.title,
+            artist: row.artist,
+            dedication: row.dedication,
+            guest_name: row.guest_name,
+            status,
+            created_at: row.created_at,
+            updated_at: row.updated_at,
+        })
+    }
+}
+
+/// Wykonuje zapytanie zwracające wiersze kolejki (zawsze z [`QUEUE_COLUMNS`]).
+fn query_requests(
+    conn: &Connection,
+    sql: &str,
+    params: impl rusqlite::Params,
+) -> Result<Vec<QueuedRequest>, DbError> {
+    let mut statement = conn.prepare(sql)?;
+
+    let rows = statement.query_map(params, |row| {
+        Ok(QueuedRequestRow {
+            id: row.get(0)?,
+            track_id: row.get(1)?,
+            title: row.get(2)?,
+            artist: row.get(3)?,
+            dedication: row.get(4)?,
+            guest_name: row.get(5)?,
+            status: row.get(6)?,
+            created_at: row.get(7)?,
+            updated_at: row.get(8)?,
+        })
+    })?;
+
+    let mut requests = Vec::new();
+
+    for row in rows {
+        requests.push(QueuedRequest::try_from(row?)?);
+    }
+
+    Ok(requests)
+}
+
+/// Bieżący status prośby; `None` oznacza, że prośby nie ma w bazie.
+fn current_status(conn: &Connection, id: i64) -> Result<Option<RequestStatus>, DbError> {
+    let stored: Option<String> = conn
+        .query_row(
+            "SELECT status FROM requests WHERE id = ?1",
+            params![id],
+            |row| row.get(0),
+        )
+        .optional()?;
+
+    match stored {
+        None => Ok(None),
+        Some(status) => RequestStatus::parse(&status)
+            .map(Some)
+            .ok_or(DbError::UnknownStatus(status)),
+    }
+}
+
+/// Błąd przejścia, którego kolejki nie dopuszczają.
+fn invalid_transition(id: i64, from: RequestStatus, to: RequestStatus) -> DbError {
+    DbError::InvalidTransition {
+        id,
+        from: from.as_str(),
+        to: to.as_str(),
     }
 }
 
@@ -444,6 +713,8 @@ pub struct QueuedRequest {
     pub guest_name: Option<String>,
     pub status: RequestStatus,
     pub created_at: i64,
+    /// Czas ostatniej zmiany — po nim sortujemy historię.
+    pub updated_at: i64,
 }
 
 /// Folder wybrany przez DJ-a do skanowania.
@@ -584,6 +855,15 @@ mod tests {
             assert!(
                 track_columns.iter().any(|name| name == column),
                 "brak kolumny {column} potrzebnej do wyszukiwania"
+            );
+        }
+
+        let request_columns = columns(&db, "requests");
+
+        for column in ["position", "kiosk_request_id"] {
+            assert!(
+                request_columns.iter().any(|name| name == column),
+                "brak kolumny {column} potrzebnej kolejkom"
             );
         }
     }
@@ -855,7 +1135,7 @@ mod tests {
         let kiosk = db.kiosk_by_name("Kiosk 1").expect("parowanie");
         let track_id = db.search_tracks("kombi", 10).expect("szukanie")[0].id;
 
-        db.insert_request(track_id, "Dla Kasi", Some("Ania"), Some(kiosk))
+        db.insert_request(track_id, "Dla Kasi", Some("Ania"), Some(kiosk), Some(11))
             .expect("zapis prośby");
 
         let queue = db
@@ -882,7 +1162,8 @@ mod tests {
 
         assert!(!db.track_exists(999).expect("sprawdzenie utworu"));
         assert!(
-            db.insert_request(999, "Dla Kasi", None, None).is_err(),
+            db.insert_request(999, "Dla Kasi", None, None, None)
+                .is_err(),
             "klucz obcy musi odrzucić prośbę o nieistniejący utwór"
         );
     }
@@ -896,7 +1177,7 @@ mod tests {
         let kiosk = db.kiosk_by_name("Kiosk 1").expect("parowanie");
         let now = now_ms();
 
-        db.insert_request(1, "Sto lat!", None, Some(kiosk))
+        db.insert_request(1, "Sto lat!", None, Some(kiosk), Some(1))
             .expect("zapis prośby");
 
         assert!(
@@ -914,5 +1195,247 @@ mod tests {
                 .expect("sprawdzenie duplikatu"),
             "inna treść to nie duplikat"
         );
+    }
+
+    /// Zakłada utwór i jedną prośbę, zwracając jej identyfikator — wspólny początek testów kolejek.
+    fn a_request(db: &Db, dedication: &str, kiosk_request_id: Option<u64>) -> i64 {
+        if db.count_tracks().expect("liczba utworów") == 0 {
+            store_track(db, "C:\\muzyka\\a.mp3", "Alfa", "Zespół");
+        }
+
+        let track_id = db.search_tracks("alfa", 10).expect("szukanie")[0].id;
+
+        db.insert_request(track_id, dedication, None, None, kiosk_request_id)
+            .expect("zapis prośby")
+            .0
+    }
+
+    #[test]
+    fn approving_moves_a_request_to_the_ready_queue() {
+        let db = Db::open_in_memory().expect("baza w pamięci");
+        let request = a_request(&db, "Dla Kasi i Marka", Some(5));
+
+        db.approve_request(request).expect("zatwierdzenie");
+
+        assert!(
+            db.requests_with_status(RequestStatus::Submitted, 10)
+                .expect("kolejka przeglądu")
+                .is_empty(),
+            "zatwierdzona prośba nie może zostać w kolejce przeglądu"
+        );
+
+        let ready = db.ready_requests(10).expect("kolejka gotowych");
+
+        assert_eq!(ready.len(), 1);
+        assert_eq!(ready[0].id, request);
+        assert_eq!(ready[0].status, RequestStatus::Approved);
+        assert_eq!(ready[0].dedication, "Dla Kasi i Marka");
+        assert_eq!(ready[0].title, "Alfa");
+
+        let target = db
+            .request_target(request)
+            .expect("adres prośby")
+            .expect("prośba istnieje");
+
+        assert_eq!(target.kiosk_request_id, Some(5));
+        assert_eq!(
+            target.kiosk_id, None,
+            "prośba przyszła z interfejsu, nie z kiosku"
+        );
+    }
+
+    #[test]
+    fn a_request_can_only_be_approved_once() {
+        let db = Db::open_in_memory().expect("baza w pamięci");
+        let request = a_request(&db, "Sto lat!", None);
+
+        db.approve_request(request).expect("pierwsze zatwierdzenie");
+
+        assert!(
+            matches!(
+                db.approve_request(request),
+                Err(DbError::InvalidTransition { .. })
+            ),
+            "drugie zatwierdzenie przesunęłoby prośbę na koniec kolejki"
+        );
+    }
+
+    #[test]
+    fn rejecting_works_from_both_queues_and_lands_in_history() {
+        let db = Db::open_in_memory().expect("baza w pamięci");
+        let from_review = a_request(&db, "Pierwsza", None);
+        let from_ready = a_request(&db, "Druga", None);
+
+        db.approve_request(from_ready).expect("zatwierdzenie");
+        db.reject_request(from_review)
+            .expect("odrzucenie z przeglądu");
+        db.reject_request(from_ready)
+            .expect("odrzucenie z gotowych");
+
+        assert!(
+            db.requests_with_status(RequestStatus::Submitted, 10)
+                .expect("kolejka przeglądu")
+                .is_empty()
+        );
+        assert!(
+            db.ready_requests(10).expect("kolejka gotowych").is_empty(),
+            "odrzucona prośba nie może czekać na wykonanie"
+        );
+
+        let history = db.request_history(10).expect("historia");
+
+        assert_eq!(history.len(), 2);
+        assert!(
+            history
+                .iter()
+                .all(|entry| entry.status == RequestStatus::Rejected)
+        );
+    }
+
+    #[test]
+    fn history_shows_done_and_rejected_newest_first() {
+        let db = Db::open_in_memory().expect("baza w pamięci");
+        let older = a_request(&db, "Starsza", None);
+        let newer = a_request(&db, "Nowsza", None);
+
+        db.approve_request(older).expect("zatwierdzenie");
+        db.reject_request(newer).expect("odrzucenie");
+
+        // Czasy ustawiamy wprost — `now_ms()` potrafi zwrócić tę samą milisekundę dla obu zmian.
+        let conn = db.lock().expect("blokada bazy");
+        conn.execute(
+            "UPDATE requests SET updated_at = 1_000 WHERE id = ?1",
+            params![older],
+        )
+        .expect("czas starszej prośby");
+        conn.execute(
+            "UPDATE requests SET status = 'done', updated_at = 2_000 WHERE id = ?1",
+            params![older],
+        )
+        .expect("wykonana prośba");
+        conn.execute(
+            "UPDATE requests SET updated_at = 3_000 WHERE id = ?1",
+            params![newer],
+        )
+        .expect("czas nowszej prośby");
+        drop(conn);
+
+        let history = db.request_history(10).expect("historia");
+
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[0].id, newer, "ostatnia zmiana jest pierwsza");
+        assert_eq!(history[0].status, RequestStatus::Rejected);
+        assert_eq!(history[1].id, older);
+        assert_eq!(history[1].status, RequestStatus::Done);
+    }
+
+    #[test]
+    fn editing_a_dedication_keeps_the_original_text() {
+        let db = Db::open_in_memory().expect("baza w pamięci");
+        let request = a_request(&db, "dla kasi", None);
+
+        db.set_dedication(request, "Dla Kasi i Marka — sto lat!")
+            .expect("edycja dedykacji");
+
+        let queue = db
+            .requests_with_status(RequestStatus::Submitted, 10)
+            .expect("kolejka");
+
+        assert_eq!(queue[0].dedication, "Dla Kasi i Marka — sto lat!");
+
+        let conn = db.lock().expect("blokada bazy");
+        let original: String = conn
+            .query_row(
+                "SELECT dedication_original FROM requests WHERE id = ?1",
+                params![request],
+                |row| row.get(0),
+            )
+            .expect("tekst oryginalny");
+        drop(conn);
+
+        assert_eq!(original, "dla kasi", "tekst gościa zostaje w bazie");
+    }
+
+    #[test]
+    fn the_ready_queue_keeps_the_order_the_dj_set() {
+        let db = Db::open_in_memory().expect("baza w pamięci");
+        let first = a_request(&db, "Pierwsza", None);
+        let second = a_request(&db, "Druga", None);
+        let third = a_request(&db, "Trzecia", None);
+
+        for request in [first, second, third] {
+            db.approve_request(request).expect("zatwierdzenie");
+        }
+
+        let order = |db: &Db| -> Vec<i64> {
+            db.ready_requests(10)
+                .expect("kolejka gotowych")
+                .into_iter()
+                .map(|entry| entry.id)
+                .collect()
+        };
+
+        assert_eq!(order(&db), vec![first, second, third]);
+
+        assert!(db.move_request(third, true).expect("przesunięcie"));
+        assert_eq!(order(&db), vec![first, third, second]);
+
+        assert!(
+            !db.move_request(first, true).expect("początek kolejki"),
+            "prośba z początku nie ma dokąd iść"
+        );
+        assert!(
+            !db.move_request(second, false).expect("koniec kolejki"),
+            "prośba z końca nie ma dokąd iść"
+        );
+        assert_eq!(order(&db), vec![first, third, second]);
+    }
+
+    #[test]
+    fn only_ready_requests_can_be_reordered() {
+        let db = Db::open_in_memory().expect("baza w pamięci");
+        let request = a_request(&db, "Czeka na przegląd", None);
+
+        assert!(
+            !db.move_request(request, true)
+                .expect("przesunięcie spoza kolejki"),
+            "prośba bez zatwierdzenia nie stoi w kolejce gotowych"
+        );
+    }
+
+    #[test]
+    fn a_missing_request_cannot_be_changed() {
+        let db = Db::open_in_memory().expect("baza w pamięci");
+
+        assert!(matches!(
+            db.approve_request(999),
+            Err(DbError::RequestNotFound(999))
+        ));
+        assert!(matches!(
+            db.reject_request(999),
+            Err(DbError::RequestNotFound(999))
+        ));
+        assert!(matches!(
+            db.set_dedication(999, "tekst"),
+            Err(DbError::RequestNotFound(999))
+        ));
+        assert_eq!(db.request_target(999).expect("adres prośby"), None);
+    }
+
+    #[test]
+    fn a_finished_request_cannot_be_approved_again() {
+        let db = Db::open_in_memory().expect("baza w pamięci");
+        let request = a_request(&db, "Sto lat!", None);
+
+        db.reject_request(request).expect("odrzucenie");
+
+        assert!(matches!(
+            db.approve_request(request),
+            Err(DbError::InvalidTransition { .. })
+        ));
+        assert!(matches!(
+            db.reject_request(request),
+            Err(DbError::InvalidTransition { .. })
+        ));
     }
 }

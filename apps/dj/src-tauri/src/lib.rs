@@ -98,6 +98,137 @@ async fn pending_requests(state: tauri::State<'_, AppState>) -> Result<Vec<Queue
     run_db(move || db.requests_with_status(RequestStatus::Submitted, QUEUE_LIMIT)).await
 }
 
+/// Zatwierdzone prośby w kolejności, w jakiej pójdą na antenę.
+#[tauri::command]
+async fn ready_requests(state: tauri::State<'_, AppState>) -> Result<Vec<QueuedRequest>, String> {
+    let db = Arc::clone(&state.db);
+
+    run_db(move || db.ready_requests(QUEUE_LIMIT)).await
+}
+
+/// Historia: wykonane i odrzucone dedykacje, ostatnio zmienione pierwsze.
+#[tauri::command]
+async fn request_history(state: tauri::State<'_, AppState>) -> Result<Vec<QueuedRequest>, String> {
+    let db = Arc::clone(&state.db);
+
+    run_db(move || db.request_history(QUEUE_LIMIT)).await
+}
+
+/// Zatwierdza dedykację: prośba przechodzi z kolejki przeglądu do kolejki gotowych.
+#[tauri::command(rename_all = "snake_case")]
+async fn approve_request(state: tauri::State<'_, AppState>, request_id: i64) -> Result<(), String> {
+    run_db({
+        let db = Arc::clone(&state.db);
+
+        move || db.approve_request(request_id)
+    })
+    .await?;
+
+    notify_kiosk(&state, request_id, RequestStatus::Approved).await;
+    state.server.notify_queue_changed();
+
+    info!(request_id, "prośba zatwierdzona przez DJ-a");
+
+    Ok(())
+}
+
+/// Odrzuca dedykację — z kolejki przeglądu albo z gotowych.
+#[tauri::command(rename_all = "snake_case")]
+async fn reject_request(state: tauri::State<'_, AppState>, request_id: i64) -> Result<(), String> {
+    run_db({
+        let db = Arc::clone(&state.db);
+
+        move || db.reject_request(request_id)
+    })
+    .await?;
+
+    notify_kiosk(&state, request_id, RequestStatus::Rejected).await;
+    state.server.notify_queue_changed();
+
+    info!(request_id, "prośba odrzucona przez DJ-a");
+
+    Ok(())
+}
+
+/// Zapisuje poprawioną dedykację.
+///
+/// Limit długości bierzemy z ustawień DJ-a — ten sam, który obowiązuje gościa przy wpisywaniu.
+#[tauri::command(rename_all = "snake_case")]
+async fn update_dedication(
+    state: tauri::State<'_, AppState>,
+    request_id: i64,
+    dedication: String,
+) -> Result<(), String> {
+    let max_chars = {
+        let settings = state
+            .settings
+            .lock()
+            .map_err(|_| SETTINGS_UNAVAILABLE.to_string())?;
+
+        settings.limits.dedication_max_chars as usize
+    };
+
+    let dedication = protocol::validate_dedication_with(&dedication, max_chars)
+        .map_err(|error| error.to_string())?;
+
+    run_db({
+        let db = Arc::clone(&state.db);
+
+        move || db.set_dedication(request_id, &dedication)
+    })
+    .await?;
+
+    state.server.notify_queue_changed();
+
+    info!(request_id, "dedykacja poprawiona przez DJ-a");
+
+    Ok(())
+}
+
+/// Przesuwa prośbę w kolejce gotowych o jedno miejsce. `direction` to `up` albo `down`.
+#[tauri::command(rename_all = "snake_case")]
+async fn move_request(
+    state: tauri::State<'_, AppState>,
+    request_id: i64,
+    direction: String,
+) -> Result<(), String> {
+    let up = match direction.as_str() {
+        "up" => true,
+        "down" => false,
+        other => return Err(format!("nieznany kierunek przesunięcia kolejki: {other}")),
+    };
+
+    let moved = run_db({
+        let db = Arc::clone(&state.db);
+
+        move || db.move_request(request_id, up)
+    })
+    .await?;
+
+    if moved {
+        state.server.notify_queue_changed();
+    }
+
+    Ok(())
+}
+
+/// Mówi kioskowi, który przysłał prośbę, co DJ z nią zrobił.
+///
+/// Brak połączenia z kioskiem nie jest błędem — gość zdążył już odejść, a informacja zostaje
+/// w aplikacji DJ-a.
+async fn notify_kiosk(state: &tauri::State<'_, AppState>, request_id: i64, status: RequestStatus) {
+    let db = Arc::clone(&state.db);
+
+    match run_db(move || db.request_target(request_id)).await {
+        Ok(Some(target)) => state.server.notify_request_status(target, status),
+        Ok(None) => warn!(
+            request_id,
+            "nie ma prośby, której status mielibyśmy przekazać"
+        ),
+        Err(error) => warn!(request_id, error = %error, "nie udało się ustalić adresu prośby"),
+    }
+}
+
 /// Składa stan połączeń z aktualnej listy kiosków.
 fn server_status_snapshot(server: &net::Server, port: u16) -> ServerStatus {
     let kiosks = server.connected_kiosks();
@@ -576,7 +707,13 @@ pub fn run() {
             start_library_scan,
             search_tracks,
             server_status,
-            pending_requests
+            pending_requests,
+            ready_requests,
+            request_history,
+            approve_request,
+            reject_request,
+            update_dedication,
+            move_request
         ])
         .run(tauri::generate_context!())
         .expect("nie udało się uruchomić aplikacji ANON DJ");

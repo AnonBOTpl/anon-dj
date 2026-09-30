@@ -4,20 +4,7 @@ import { motion } from "framer-motion";
 import { Check, Save } from "lucide-react";
 
 import { ui } from "../text";
-
-/** Limity długości tekstów — muszą zgadzać się z typem `Limits` w crate `protocol`. */
-type Limits = {
-  dedication_max_chars: number;
-  guest_name_max_chars: number;
-  search_query_max_chars: number;
-};
-
-type AppSettings = {
-  pin: string;
-  port: number;
-  confirmation_seconds: number;
-  limits: Limits;
-};
+import type { AppSettings } from "../types";
 
 /** Zakres czasu powrotu ekranu potwierdzenia — musi zgadzać się ze stałą w `settings.rs`. */
 const CONFIRMATION_SECONDS_RANGE = { min: 5, max: 300 } as const;

@@ -706,6 +706,32 @@ mod tests {
         }
     }
 
+    #[test]
+    fn a_status_change_from_the_dj_reaches_the_ui() {
+        let (events, mut received) = mpsc::unbounded_channel();
+        let client = Client::new(events);
+
+        // DJ rozstrzyga prośbę, którą gość oznaczył u siebie numerem 2.
+        for decided in [RequestStatus::Approved, RequestStatus::Rejected] {
+            let raw = DjMessage::RequestStatus {
+                request_id: 2,
+                status: decided,
+            }
+            .to_json()
+            .expect("kodowanie statusu");
+
+            assert_eq!(client.handle_dj_message(&raw), SessionEnd::Retry);
+
+            match received.try_recv() {
+                Ok(UiEvent::RequestReceived { request_id, status }) => {
+                    assert_eq!(request_id, 2);
+                    assert_eq!(status, decided);
+                }
+                other => panic!("oczekiwano statusu prośby, a przyszło {other:?}"),
+            }
+        }
+    }
+
     fn config(address: &str, port: u16) -> ServerConfig {
         ServerConfig {
             address: address.to_string(),
