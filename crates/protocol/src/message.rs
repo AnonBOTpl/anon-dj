@@ -30,6 +30,10 @@ pub const MAX_KIOSK_NAME_CHARS: usize = 40;
 /// Wymagana liczba cyfr w kodzie PIN parowania.
 pub const PIN_LEN: usize = 6;
 
+/// Ile sekund ekran potwierdzenia w kiosku czeka, zanim sam wróci do wyszukiwania.
+/// Wartością domyślną posługuje się kiosk, gdy DJ jej nie przysłał przy parowaniu.
+pub const DEFAULT_CONFIRMATION_SECONDS: u32 = 20;
+
 /// Limity długości tekstów, które DJ może zmienić w ustawieniach.
 ///
 /// Aplikacja DJ-a przekazuje je kioskowi przy parowaniu, żeby ten sam limit obowiązywał
@@ -140,12 +144,16 @@ pub enum KioskMessage {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum DjMessage {
-    /// Potwierdzenie parowania wraz z limitami ustawionymi przez DJ-a.
+    /// Potwierdzenie parowania wraz z ustawieniami kiosku wybranymi przez DJ-a.
     HelloOk {
         protocol_version: u16,
         kiosk_id: i64,
         server_name: String,
         limits: Limits,
+        /// Po ilu sekundach kiosk sam wraca z ekranu potwierdzenia do wyszukiwania.
+        /// Domyślna wartość ratuje starszy kiosk, któremu DJ nie przysłał tego pola.
+        #[serde(default = "default_confirmation_seconds")]
+        confirmation_seconds: u32,
     },
     /// Wyniki wyszukiwania (tylko metadane).
     SearchResults {
@@ -203,6 +211,11 @@ impl KioskMessage {
             }
         }
     }
+}
+
+/// Wartość domyślna dla `HelloOk::confirmation_seconds` (serde wymaga funkcji).
+fn default_confirmation_seconds() -> u32 {
+    DEFAULT_CONFIRMATION_SECONDS
 }
 
 impl DjMessage {
@@ -280,12 +293,29 @@ mod tests {
                 guest_name_max_chars: 30,
                 search_query_max_chars: 60,
             },
+            confirmation_seconds: 30,
         };
 
         let json = message.to_json().expect("serializacja");
         let parsed = DjMessage::from_json(&json).expect("deserializacja");
 
         assert_eq!(message, parsed);
+    }
+
+    #[test]
+    fn hello_ok_without_confirmation_seconds_falls_back_to_the_default() {
+        // Starszy DJ bez tego pola nie może wywalić kiosku — dostajemy wartość domyślną.
+        let json = format!(
+            r#"{{"type":"hello_ok","protocol_version":{PROTOCOL_VERSION},"kiosk_id":1,"server_name":"ANON DJ","limits":{{"dedication_max_chars":400,"guest_name_max_chars":40,"search_query_max_chars":80}}}}"#
+        );
+
+        match DjMessage::from_json(&json).expect("deserializacja") {
+            DjMessage::HelloOk {
+                confirmation_seconds,
+                ..
+            } => assert_eq!(confirmation_seconds, DEFAULT_CONFIRMATION_SECONDS),
+            other => panic!("oczekiwano hello_ok, a przyszło {other:?}"),
+        }
     }
 
     #[test]

@@ -8,9 +8,9 @@ pub mod message;
 pub mod validation;
 
 pub use message::{
-    DjMessage, ErrorCode, KioskMessage, Limits, MAX_DEDICATION_CHARS, MAX_GUEST_NAME_CHARS,
-    MAX_KIOSK_NAME_CHARS, MAX_MESSAGE_BYTES, MAX_SEARCH_QUERY_CHARS, MAX_SEARCH_RESULTS,
-    MessageError, PIN_LEN, PROTOCOL_VERSION, RequestStatus, TrackInfo,
+    DEFAULT_CONFIRMATION_SECONDS, DjMessage, ErrorCode, KioskMessage, Limits, MAX_DEDICATION_CHARS,
+    MAX_GUEST_NAME_CHARS, MAX_KIOSK_NAME_CHARS, MAX_MESSAGE_BYTES, MAX_SEARCH_QUERY_CHARS,
+    MAX_SEARCH_RESULTS, MessageError, PIN_LEN, PROTOCOL_VERSION, RequestStatus, TrackInfo,
 };
 pub use validation::{
     ValidationError, count_chars, normalize_text, validate_dedication, validate_dedication_with,

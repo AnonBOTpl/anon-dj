@@ -22,6 +22,9 @@ type ErrorPayload = { request_id: number | null; code: ErrorCode };
 
 type Screen = "search" | "dedication" | "sent";
 
+/** Zapasowy czas powrotu ekranu potwierdzenia, gdy aplikacja DJ-a go nie przysłała. */
+const FALLBACK_CONFIRMATION_SECONDS = 20;
+
 /** Komunikat dla gościa. Kody błędów z sieci tłumaczymy tutaj — po sieci nie jadą teksty. */
 function errorText(code: ErrorCode): string {
   return ui.errors[code] ?? ui.errors.unknown;
@@ -48,6 +51,7 @@ export default function App() {
   const [guestName, setGuestName] = useState("");
   const [sending, setSending] = useState(false);
   const [sentStatus, setSentStatus] = useState<RequestStatus>("submitted");
+  const [sentSecondsLeft, setSentSecondsLeft] = useState(FALLBACK_CONFIRMATION_SECONDS);
 
   // Identyfikatory trzymamy w referencjach: nasłuchy nie mogą się przepinać przy każdej zmianie.
   const searchRequestId = useRef<number | null>(null);
@@ -116,6 +120,31 @@ export default function App() {
       void unlistenError.then((stop) => stop());
     };
   }, []);
+
+  /* Czas powrotu ustawia DJ w swojej aplikacji — kiosk dostaje go przy parowaniu. */
+  const confirmationSeconds =
+    connection.state === "connected"
+      ? connection.confirmation_seconds
+      : FALLBACK_CONFIRMATION_SECONDS;
+
+  // Po wysłaniu dedykacji kiosk sam wraca do szukania — kolejny gość nie musi nic klikać.
+  useEffect(() => {
+    if (screen !== "sent") {
+      return;
+    }
+
+    setSentSecondsLeft(confirmationSeconds);
+
+    const tick = window.setInterval(() => {
+      setSentSecondsLeft((left) => Math.max(0, left - 1));
+    }, 1000);
+    const finish = window.setTimeout(handleAgain, confirmationSeconds * 1000);
+
+    return () => {
+      window.clearInterval(tick);
+      window.clearTimeout(finish);
+    };
+  }, [screen, confirmationSeconds]);
 
   async function handleConnect() {
     const port = Number(config.port);
@@ -248,7 +277,12 @@ export default function App() {
       )}
 
       {screen === "sent" && selected !== null && (
-        <SentScreen track={selected} status={sentStatus} onAgain={handleAgain} />
+        <SentScreen
+          track={selected}
+          status={sentStatus}
+          secondsLeft={sentSecondsLeft}
+          onAgain={handleAgain}
+        />
       )}
     </div>
   );

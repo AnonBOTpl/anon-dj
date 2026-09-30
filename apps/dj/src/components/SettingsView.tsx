@@ -15,8 +15,12 @@ type Limits = {
 type AppSettings = {
   pin: string;
   port: number;
+  confirmation_seconds: number;
   limits: Limits;
 };
+
+/** Zakres czasu powrotu ekranu potwierdzenia — musi zgadzać się ze stałą w `settings.rs`. */
+const CONFIRMATION_SECONDS_RANGE = { min: 5, max: 300 } as const;
 
 const numberFields = [
   {
@@ -39,6 +43,7 @@ const numberFields = [
 export function SettingsView() {
   const [pin, setPin] = useState("");
   const [port, setPort] = useState("");
+  const [confirmationSeconds, setConfirmationSeconds] = useState("");
   const [values, setValues] = useState<Record<string, string>>({});
   const [busy, setBusy] = useState(false);
   const [saved, setSaved] = useState(false);
@@ -55,6 +60,7 @@ export function SettingsView() {
 
         setPin(settings.pin);
         setPort(String(settings.port));
+        setConfirmationSeconds(String(settings.confirmation_seconds));
         setValues({
           dedication_max_chars: String(settings.limits.dedication_max_chars),
           guest_name_max_chars: String(settings.limits.guest_name_max_chars),
@@ -99,6 +105,18 @@ export function SettingsView() {
       return;
     }
 
+    const parsedConfirmationSeconds = Number(confirmationSeconds);
+
+    if (
+      !Number.isInteger(parsedConfirmationSeconds) ||
+      parsedConfirmationSeconds < CONFIRMATION_SECONDS_RANGE.min ||
+      parsedConfirmationSeconds > CONFIRMATION_SECONDS_RANGE.max
+    ) {
+      setError(ui.settings.confirmationSecondsError);
+
+      return;
+    }
+
     setBusy(true);
 
     try {
@@ -106,6 +124,7 @@ export function SettingsView() {
         settings: {
           pin,
           port: parsedPort,
+          confirmation_seconds: parsedConfirmationSeconds,
           limits,
         },
       });
@@ -160,6 +179,24 @@ export function SettingsView() {
           className="w-40 rounded border border-scena-700 bg-scena-950 px-3 py-2 text-zinc-100 outline-none focus:border-zinc-500"
         />
         <span className="text-xs text-zinc-500">{ui.settings.portHint}</span>
+      </label>
+
+      <label className="flex flex-col gap-1">
+        <span className="text-xs font-medium text-zinc-300">
+          {ui.settings.confirmationSecondsLabel}
+        </span>
+        <input
+          type="number"
+          min={CONFIRMATION_SECONDS_RANGE.min}
+          max={CONFIRMATION_SECONDS_RANGE.max}
+          value={confirmationSeconds}
+          onChange={(event) => {
+            setConfirmationSeconds(event.currentTarget.value);
+            setSaved(false);
+          }}
+          className="w-40 rounded border border-scena-700 bg-scena-950 px-3 py-2 text-zinc-100 outline-none focus:border-zinc-500"
+        />
+        <span className="text-xs text-zinc-500">{ui.settings.confirmationSecondsHint}</span>
       </label>
 
       <div className="grid grid-cols-3 gap-4">

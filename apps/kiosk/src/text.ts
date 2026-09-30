@@ -50,6 +50,8 @@ export const ui = {
     heading: "Dedykacja poszła do DJ-a",
     subheading: "Zaraz zobaczy ją na swoim komputerze.",
     again: "Nowa dedykacja",
+    // Odliczanie do samoczynnego powrotu do wyszukiwania — kolejny gość nie musi nic klikać.
+    countdown: (seconds: number) => `Za ${seconds} s kiosk wróci do szukania.`,
   },
 
   // Statusy prośby pokazywane gościowi.

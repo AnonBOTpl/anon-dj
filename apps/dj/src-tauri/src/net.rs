@@ -360,6 +360,7 @@ impl Server {
             kiosk_id,
             server_name: SERVER_NAME.to_string(),
             limits,
+            confirmation_seconds: self.confirmation_seconds(),
         };
 
         if !send(ws, &hello_ok).await {
@@ -707,6 +708,14 @@ impl Server {
         }
     }
 
+    /// Czas powrotu ekranu potwierdzenia w kiosku (ustawienie DJ-a).
+    fn confirmation_seconds(&self) -> u32 {
+        match self.settings.lock() {
+            Ok(settings) => settings.confirmation_seconds,
+            Err(_) => protocol::DEFAULT_CONFIRMATION_SECONDS,
+        }
+    }
+
     fn pin_matches(&self, pin: &str) -> bool {
         match self.settings.lock() {
             Ok(settings) => settings.pin == pin,
@@ -932,7 +941,7 @@ mod tests {
             "po złym PIN-ie serwer zamyka połączenie"
         );
 
-        // 2. Właściwy PIN paruje kiosk i odsyła limity z ustawień DJ-a.
+        // 2. Właściwy PIN paruje kiosk i odsyła ustawienia z aplikacji DJ-a.
         let mut ws = connect(port).await;
         send_message(&mut ws, &hello(DEFAULT_PIN)).await;
 
@@ -941,7 +950,18 @@ mod tests {
             .expect("brak odpowiedzi na hello");
 
         match hello_ok {
-            DjMessage::HelloOk { limits, .. } => assert_eq!(limits, Limits::default()),
+            DjMessage::HelloOk {
+                limits,
+                confirmation_seconds,
+                ..
+            } => {
+                assert_eq!(limits, Limits::default());
+                assert_eq!(
+                    confirmation_seconds,
+                    AppSettings::default().confirmation_seconds,
+                    "kiosk dostaje czas powrotu ekranu potwierdzenia z ustawień DJ-a"
+                );
+            }
             other => panic!("oczekiwano hello_ok, a przyszło {other:?}"),
         }
 

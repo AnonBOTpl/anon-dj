@@ -7,11 +7,16 @@ import type { RequestStatus, TrackInfo } from "../types";
 type SentScreenProps = {
   track: TrackInfo;
   status: RequestStatus;
+  /** Ile sekund zostało do samoczynnego powrotu na ekran wyszukiwania. */
+  secondsLeft: number;
   onAgain: () => void;
 };
 
-/** Ekran po wysłaniu: gość widzi, że zgłoszenie dotarło, i ma czym zacząć od nowa. */
-export function SentScreen({ track, status, onAgain }: SentScreenProps) {
+/**
+ * Ekran po wysłaniu: gość widzi, że zgłoszenie dotarło, i ma czym zacząć od nowa.
+ * Kiosk sam wraca do wyszukiwania po `secondsLeft`, żeby kolejny gość mógł od razu pisać.
+ */
+export function SentScreen({ track, status, secondsLeft, onAgain }: SentScreenProps) {
   const positive = status !== "rejected";
 
   return (
@@ -33,6 +38,7 @@ export function SentScreen({ track, status, onAgain }: SentScreenProps) {
 
         <p className="mt-6 truncate text-xl text-zinc-100">{track.title}</p>
         <p className="mt-1 text-lg text-zinc-400">{ui.status[status]}</p>
+        <p className="mt-4 text-base text-zinc-500">{ui.sent.countdown(secondsLeft)}</p>
 
         <button
           type="button"

@@ -85,6 +85,8 @@ pub enum ConnectionState {
         /// Limity ustawione przez DJ-a — kiosk pokazuje gościowi ten sam limit, co walidacja
         /// po stronie DJ-a.
         limits: Limits,
+        /// Po ilu sekundach ekran potwierdzenia sam wraca do wyszukiwania (ustawienie DJ-a).
+        confirmation_seconds: u32,
     },
 }
 
@@ -321,12 +323,13 @@ impl Client {
             }
         };
 
-        let (server_name, kiosk_id, limits) = match reply {
+        let (server_name, kiosk_id, limits, confirmation_seconds) = match reply {
             KioskMessageReply::HelloOk {
                 server_name,
                 kiosk_id,
                 limits,
-            } => (server_name, kiosk_id, limits),
+                confirmation_seconds,
+            } => (server_name, kiosk_id, limits, confirmation_seconds),
             KioskMessageReply::Error { code } => {
                 warn!(code = ?code, "aplikacja DJ-a odrzuciła parowanie");
 
@@ -347,7 +350,14 @@ impl Client {
 
         let (outbox, mut outgoing) = mpsc::unbounded_channel::<KioskMessage>();
 
-        if !self.publish_connected(session, outbox, server_name, kiosk_id, limits) {
+        if !self.publish_connected(
+            session,
+            outbox,
+            server_name,
+            kiosk_id,
+            limits,
+            confirmation_seconds,
+        ) {
             return SessionEnd::Stop;
         }
 
@@ -452,11 +462,13 @@ impl Client {
         server_name: String,
         kiosk_id: i64,
         limits: Limits,
+        confirmation_seconds: u32,
     ) -> bool {
         let state = ConnectionState::Connected {
             server_name,
             kiosk_id,
             limits,
+            confirmation_seconds,
         };
 
         let registered = match self.inner.lock() {
@@ -497,6 +509,7 @@ enum KioskMessageReply {
         server_name: String,
         kiosk_id: i64,
         limits: Limits,
+        confirmation_seconds: u32,
     },
     Error {
         code: ErrorCode,
@@ -511,11 +524,13 @@ impl KioskMessageReply {
                 server_name,
                 kiosk_id,
                 limits,
+                confirmation_seconds,
                 ..
             }) => Self::HelloOk {
                 server_name,
                 kiosk_id,
                 limits,
+                confirmation_seconds,
             },
             Ok(DjMessage::Error { code, .. }) => Self::Error { code },
             Ok(_) | Err(_) => Self::Other,
@@ -617,6 +632,7 @@ mod tests {
                     kiosk_id: 7,
                     server_name: "ANON DJ".to_string(),
                     limits: Limits::default(),
+                    confirmation_seconds: 20,
                 }
                 .to_json()
                 .expect("kodowanie hello_ok"),

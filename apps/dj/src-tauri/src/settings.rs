@@ -22,6 +22,8 @@ pub const KEY_GUEST_NAME_MAX_CHARS: &str = "limits.guest_name_max_chars";
 pub const KEY_SEARCH_QUERY_MAX_CHARS: &str = "limits.search_query_max_chars";
 /// Klucz ustawienia z portem lokalnego serwera dla kiosków.
 pub const KEY_PORT: &str = "server.port";
+/// Klucz ustawienia z czasem powrotu ekranu potwierdzenia w kiosku.
+pub const KEY_CONFIRMATION_SECONDS: &str = "kiosk.confirmation_seconds";
 
 /// PIN, od którego startuje świeża instalacja. DJ może i powinien go zmienić w ustawieniach.
 pub const DEFAULT_PIN: &str = "123456";
@@ -33,6 +35,14 @@ pub const DEFAULT_PORT: u16 = 8790;
 /// Dopuszczalny zakres portu. Porty poniżej 1024 wymagają uprawnień administratora,
 /// a 0 kazałoby systemowi wybrać port losowy — DJ nie miałby czego wpisać w kiosku.
 pub const PORT_RANGE: (u16, u16) = (1024, 65_535);
+
+/// Ile sekund ekran potwierdzenia w kiosku pokazuje się, zanim sam wróci do wyszukiwania.
+/// Gość zdąży przeczytać, a kolejna osoba nie czeka — wartość do zmiany w ustawieniach.
+pub const DEFAULT_CONFIRMATION_SECONDS: u32 = 20;
+
+/// Dopuszczalny zakres czasu powrotu ekranu potwierdzenia. Poniżej 5 s gość nie zdąży
+/// przeczytać, a powyżej 300 s kiosk stoi zablokowany dla kolejnej osoby.
+pub const CONFIRMATION_SECONDS_RANGE: (u32, u32) = (5, 300);
 
 /// Dopuszczalny zakres limitu dedykacji. Za krótki ucina gościowi tekst, za długi każe mu czekać
 /// przy kiosku — oba skrajne przypadki szkodzą imprezie.
@@ -77,6 +87,8 @@ pub struct AppSettings {
     pub pin: String,
     /// Port, na którym aplikacja DJ-a nasłuchuje kiosków.
     pub port: u16,
+    /// Po ilu sekundach ekran potwierdzenia w kiosku wraca sam do wyszukiwania.
+    pub confirmation_seconds: u32,
     pub limits: Limits,
 }
 
@@ -85,6 +97,7 @@ impl Default for AppSettings {
         Self {
             pin: DEFAULT_PIN.to_string(),
             port: DEFAULT_PORT,
+            confirmation_seconds: DEFAULT_CONFIRMATION_SECONDS,
             limits: Limits::default(),
         }
     }
@@ -102,6 +115,8 @@ impl AppSettings {
         let settings = Self {
             pin: db.setting(KEY_PIN)?.unwrap_or(defaults.pin),
             port: read_port(db, KEY_PORT)?.unwrap_or(defaults.port),
+            confirmation_seconds: read_u32(db, KEY_CONFIRMATION_SECONDS)?
+                .unwrap_or(defaults.confirmation_seconds),
             limits: Limits {
                 dedication_max_chars: read_u32(db, KEY_DEDICATION_MAX_CHARS)?
                     .unwrap_or(defaults.limits.dedication_max_chars),
@@ -123,6 +138,10 @@ impl AppSettings {
 
         db.set_setting(KEY_PIN, &self.pin)?;
         db.set_setting(KEY_PORT, &self.port.to_string())?;
+        db.set_setting(
+            KEY_CONFIRMATION_SECONDS,
+            &self.confirmation_seconds.to_string(),
+        )?;
         db.set_setting(
             KEY_DEDICATION_MAX_CHARS,
             &self.limits.dedication_max_chars.to_string(),
@@ -147,6 +166,11 @@ impl AppSettings {
 
         check_port(self.port)?;
 
+        check_range(
+            KEY_CONFIRMATION_SECONDS,
+            CONFIRMATION_SECONDS_RANGE,
+            self.confirmation_seconds,
+        )?;
         check_range(
             KEY_DEDICATION_MAX_CHARS,
             DEDICATION_MAX_CHARS_RANGE,
@@ -231,6 +255,11 @@ mod tests {
         assert!(settings.validate().is_ok());
         assert_eq!(settings.limits, Limits::default());
         assert_eq!(settings.pin, DEFAULT_PIN);
+        assert_eq!(
+            settings.confirmation_seconds,
+            protocol::DEFAULT_CONFIRMATION_SECONDS,
+            "domyślny czas potwierdzenia musi zgadzać się z protokołem"
+        );
     }
 
     #[test]
@@ -249,6 +278,7 @@ mod tests {
         let settings = AppSettings {
             pin: "654321".to_string(),
             port: 9000,
+            confirmation_seconds: 45,
             limits: Limits {
                 dedication_max_chars: 300,
                 guest_name_max_chars: 25,
@@ -267,8 +297,7 @@ mod tests {
 
         let settings = AppSettings {
             pin: "12345".to_string(),
-            port: DEFAULT_PORT,
-            limits: Limits::default(),
+            ..AppSettings::default()
         };
 
         assert!(matches!(
@@ -289,12 +318,11 @@ mod tests {
         let db = Db::open_in_memory().expect("baza w pamięci");
 
         let too_short = AppSettings {
-            pin: DEFAULT_PIN.to_string(),
-            port: DEFAULT_PORT,
             limits: Limits {
                 dedication_max_chars: 10,
                 ..Limits::default()
             },
+            ..AppSettings::default()
         };
 
         assert!(matches!(
@@ -312,6 +340,42 @@ mod tests {
             AppSettings::load(&db),
             Err(SettingsError::OutOfRange {
                 key: KEY_SEARCH_QUERY_MAX_CHARS,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn confirmation_seconds_must_be_within_the_allowed_range() {
+        let db = Db::open_in_memory().expect("baza w pamięci");
+
+        let too_short = AppSettings {
+            confirmation_seconds: 1,
+            ..AppSettings::default()
+        };
+
+        assert!(matches!(
+            too_short.validate(),
+            Err(SettingsError::OutOfRange {
+                key: KEY_CONFIRMATION_SECONDS,
+                ..
+            })
+        ));
+        assert!(matches!(
+            too_short.save(&db),
+            Err(SettingsError::OutOfRange {
+                key: KEY_CONFIRMATION_SECONDS,
+                ..
+            })
+        ));
+
+        db.set_setting(KEY_CONFIRMATION_SECONDS, "9999")
+            .expect("zapis do bazy");
+
+        assert!(matches!(
+            AppSettings::load(&db),
+            Err(SettingsError::OutOfRange {
+                key: KEY_CONFIRMATION_SECONDS,
                 ..
             })
         ));

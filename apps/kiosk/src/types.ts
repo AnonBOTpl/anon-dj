@@ -39,4 +39,6 @@ export type ConnectionState =
       server_name: string;
       kiosk_id: number;
       limits: Limits;
+      /** Po ilu sekundach ekran potwierdzenia sam wraca do wyszukiwania (ustawienie DJ-a). */
+      confirmation_seconds: number;
     };
