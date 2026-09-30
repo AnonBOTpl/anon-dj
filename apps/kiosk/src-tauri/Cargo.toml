@@ -19,5 +19,11 @@ tauri-build = { version = "2", features = [] }
 tauri = { version = "2", features = [] }
 protocol.workspace = true
 serde.workspace = true
+thiserror.workspace = true
 tracing.workspace = true
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+# Sieć: klient WebSocket łączący się z aplikacją DJ-a (z automatycznym ponawianiem).
+tokio = { version = "1.53.1", features = ["net", "sync", "time", "rt", "macros"] }
+tokio-tungstenite = "0.30.0"
+# Metody `next()`/`send()` na strumieniu WebSocket to cechy z `futures`.
+futures-util = "0.3.34"

@@ -14,6 +14,7 @@ type Limits = {
 
 type AppSettings = {
   pin: string;
+  port: number;
   limits: Limits;
 };
 
@@ -37,6 +38,7 @@ const numberFields = [
 
 export function SettingsView() {
   const [pin, setPin] = useState("");
+  const [port, setPort] = useState("");
   const [values, setValues] = useState<Record<string, string>>({});
   const [busy, setBusy] = useState(false);
   const [saved, setSaved] = useState(false);
@@ -52,6 +54,7 @@ export function SettingsView() {
         }
 
         setPin(settings.pin);
+        setPort(String(settings.port));
         setValues({
           dedication_max_chars: String(settings.limits.dedication_max_chars),
           guest_name_max_chars: String(settings.limits.guest_name_max_chars),
@@ -88,12 +91,21 @@ export function SettingsView() {
       limits[field.key] = parsed;
     }
 
+    const parsedPort = Number(port);
+
+    if (!Number.isInteger(parsedPort) || parsedPort < 1024 || parsedPort > 65535) {
+      setError(ui.settings.portError);
+
+      return;
+    }
+
     setBusy(true);
 
     try {
       await invoke("save_settings", {
         settings: {
           pin,
+          port: parsedPort,
           limits,
         },
       });
@@ -132,6 +144,22 @@ export function SettingsView() {
           className="w-40 rounded border border-scena-700 bg-scena-950 px-3 py-2 font-mono text-lg tracking-[0.3em] text-zinc-100 outline-none focus:border-zinc-500"
         />
         <span className="text-xs text-zinc-500">{ui.settings.pinHint}</span>
+      </label>
+
+      <label className="flex flex-col gap-1">
+        <span className="text-xs font-medium text-zinc-300">{ui.settings.portLabel}</span>
+        <input
+          type="number"
+          min={1024}
+          max={65535}
+          value={port}
+          onChange={(event) => {
+            setPort(event.currentTarget.value);
+            setSaved(false);
+          }}
+          className="w-40 rounded border border-scena-700 bg-scena-950 px-3 py-2 text-zinc-100 outline-none focus:border-zinc-500"
+        />
+        <span className="text-xs text-zinc-500">{ui.settings.portHint}</span>
       </label>
 
       <div className="grid grid-cols-3 gap-4">

@@ -27,3 +27,20 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 tracing-appender = "0.2.5"
 # SQLite wkompilowane w binarkę (`bundled`) — żadnych zewnętrznych DLL-i, pełny offline.
 rusqlite = { version = "0.40.2", features = ["bundled"] }
+# Rekurencyjne przechodzenie po folderach biblioteki (własna implementacja byłaby dłuższa i gorsza
+# w obsłudze dowiązań oraz błędów dostępu).
+walkdir = "2.5.0"
+# Odczyt metadanych z plików audio: ID3, Vorbis Comments, MP4/ilst itd. Bez własnego parsera ID3.
+lofty = "0.25.4"
+# Natywne okno wyboru folderu. Alternatywą byłoby ręczne wpisywanie ścieżki, ale DJ przy imprezie
+# nie powinien walczyć z literówkami w „C:\Muzyka\Wesela 2026”.
+tauri-plugin-dialog = "2"
+# Sieć: serwer WebSocket dla kiosków. `tokio` i tak ciągnie Tauri, ale dopisujemy je wprost,
+# bo używamy własnych typów sieciowych, kanałów i limitów czasu.
+tokio = { version = "1.53.1", features = ["net", "sync", "time", "rt", "macros"] }
+# Obsługa samego protokołu WebSocket (handshake, ramki, ping/pong) — pisanie tego ręcznie
+# byłoby proszeniem się o błędy w najbardziej newralgicznym miejscu imprezy.
+tokio-tungstenite = "0.30.0"
+# Metody `next()`/`send()` na strumieniu WebSocket to cechy z `futures` — `tokio-tungstenite`
+# sam ich nie wystawia. Crate jest już w drzewie zależności (ciągnie go Tauri).
+futures-util = "0.3.34"

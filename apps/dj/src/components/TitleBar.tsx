@@ -11,6 +11,12 @@ const appWindow = getCurrentWindow();
  *
  * Warstwa przeciągania (`data-tauri-drag-region`) jest osobnym divem pod spodem (z-0) —
  * nigdy na elemencie zawierającym przyciski, bo pożerałaby ich kliknięcia.
+ *
+ * Tauri sprawdza przy `mousedown` **cel zdarzenia**: element z atrybutem musi być tym klikniętym.
+ * Warstwa z treścią (z-10) rozciąga się na cały nagłówek, więc bez `pointer-events-none`
+ * zasłaniałaby warstwę przeciągania i okna nie dałoby się przesunąć. Przyciski dostają zdarzenia
+ * z powrotem przez `pointer-events-auto` — dodatkowo Tauri sam pomija elementy klikalne
+ * (przycisk, pole tekstowe), więc przeciąganie ich nie łapie.
  */
 export function TitleBar() {
   async function handleMinimize(event: MouseEvent<HTMLButtonElement>) {
@@ -27,12 +33,12 @@ export function TitleBar() {
     <header className="relative flex h-9 shrink-0 items-center border-b border-scena-800 bg-scena-900 px-3">
       <div data-tauri-drag-region className="absolute inset-0 z-0" />
 
-      <div className="relative z-10 flex w-full items-center justify-between">
+      <div className="pointer-events-none relative z-10 flex w-full items-center justify-between">
         <span className="text-xs font-semibold tracking-[0.3em] text-zinc-400">
           {ui.appName}
         </span>
 
-        <div className="flex items-center gap-1">
+        <div className="pointer-events-auto flex items-center gap-1">
           <button
             type="button"
             onClick={handleMinimize}

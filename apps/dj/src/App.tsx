@@ -1,9 +1,21 @@
-import { useEffect, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useState, type ReactNode } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { motion } from "framer-motion";
-import { Disc3, ListChecks, Settings, TriangleAlert, WifiOff } from "lucide-react";
+import {
+  Disc3,
+  Library,
+  ListChecks,
+  Server,
+  Settings,
+  TriangleAlert,
+  Wifi,
+  WifiOff,
+} from "lucide-react";
 
+import { LibraryView } from "./components/LibraryView";
 import { Panel } from "./components/Panel";
+import { RequestList, type QueuedRequest } from "./components/RequestList";
 import { SettingsView } from "./components/SettingsView";
 import { TitleBar } from "./components/TitleBar";
 import { ui } from "./text";
@@ -16,7 +28,21 @@ type AppStatus = {
   log_dir: string;
 };
 
-type View = "queues" | "settings";
+/** Stan serwera kiosków — zgadza się z `ServerStatus` w warstwie Rust. */
+type ServerStatus = {
+  port: number;
+  address: string | null;
+  listening: boolean;
+  connected: number;
+  kiosks: string[];
+};
+
+/** Zdarzenie o zmianie kolejki prośb. */
+const EVENT_REQUESTS_CHANGED = "requests://changed";
+/** Zdarzenie o zmianie stanu serwera kiosków. */
+const EVENT_KIOSK_STATUS = "kiosk://status";
+
+type View = "queues" | "library" | "settings";
 
 type ChipTone = "neutral" | "warning" | "danger";
 
@@ -81,8 +107,60 @@ function NavButton({
 
 export default function App() {
   const [status, setStatus] = useState<AppStatus | null>(null);
+  const [server, setServer] = useState<ServerStatus | null>(null);
+  const [requests, setRequests] = useState<QueuedRequest[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [view, setView] = useState<View>("queues");
+
+  const refreshRequests = useCallback(async () => {
+    const pending = await invoke<QueuedRequest[]>("pending_requests");
+
+    setRequests(pending);
+  }, []);
+
+  // Serwer kiosków melduje się zdarzeniem; na starcie pytamy o stan raz, żeby pasek statusu
+  // nie czekał na pierwsze połączenie.
+  useEffect(() => {
+    let active = true;
+
+    invoke<ServerStatus>("server_status")
+      .then((value) => {
+        if (active) {
+          setServer(value);
+        }
+      })
+      .catch((reason: unknown) => {
+        if (active) {
+          setError(String(reason));
+        }
+      });
+
+    const unlisten = listen<ServerStatus>(EVENT_KIOSK_STATUS, (event) => {
+      setServer(event.payload);
+    });
+
+    return () => {
+      active = false;
+      void unlisten.then((stop) => stop());
+    };
+  }, []);
+
+  // Kolejka prośb: raz na start i po każdym zgłoszeniu gościa.
+  useEffect(() => {
+    void refreshRequests().catch((reason: unknown) => {
+      setError(`${ui.requests.loadError} ${String(reason)}`);
+    });
+
+    const unlisten = listen(EVENT_REQUESTS_CHANGED, () => {
+      void refreshRequests().catch((reason: unknown) => {
+        setError(`${ui.requests.loadError} ${String(reason)}`);
+      });
+    });
+
+    return () => {
+      void unlisten.then((stop) => stop());
+    };
+  }, [refreshRequests]);
 
   useEffect(() => {
     let active = true;
@@ -104,6 +182,18 @@ export default function App() {
     };
   }, []);
 
+  const kioskConnected = (server?.connected ?? 0) > 0;
+  const kioskValue = kioskConnected
+    ? (server?.kiosks ?? []).join(", ")
+    : ui.status.kioskDisconnected;
+
+  const serverValue =
+    server === null
+      ? ui.status.loading
+      : server.listening
+        ? `${server.address ?? ui.status.serverUnknownAddress}:${server.port}`
+        : ui.status.serverUnavailable;
+
   return (
     <div className="app-chrome flex h-full flex-col bg-scena-950">
       <TitleBar />
@@ -116,10 +206,16 @@ export default function App() {
           tone="neutral"
         />
         <Chip
-          icon={<WifiOff className="h-3.5 w-3.5" />}
+          icon={kioskConnected ? <Wifi className="h-3.5 w-3.5" /> : <WifiOff className="h-3.5 w-3.5" />}
           label={ui.status.kiosk}
-          value={ui.status.kioskDisconnected}
-          tone="warning"
+          value={kioskValue}
+          tone={kioskConnected ? "neutral" : "warning"}
+        />
+        <Chip
+          icon={<Server className="h-3.5 w-3.5" />}
+          label={ui.status.server}
+          value={serverValue}
+          tone={server === null || server.listening ? "neutral" : "danger"}
         />
         {error !== null && (
           <Chip
@@ -138,6 +234,12 @@ export default function App() {
             onClick={() => setView("queues")}
           />
           <NavButton
+            active={view === "library"}
+            icon={<Library className="h-4 w-4" />}
+            label={ui.nav.library}
+            onClick={() => setView("library")}
+          />
+          <NavButton
             active={view === "settings"}
             icon={<Settings className="h-4 w-4" />}
             label={ui.nav.settings}
@@ -147,13 +249,15 @@ export default function App() {
       </section>
 
       <main className="min-h-0 flex-1 overflow-y-auto p-3">
-        {view === "queues" ? (
+        {view === "queues" && (
           <div className="grid h-full min-h-0 grid-cols-[1.5fr_1fr] gap-3">
             <Panel
               title={ui.queue.reviewTitle}
               hint={ui.queue.reviewHint}
               empty={ui.queue.reviewEmpty}
-            />
+            >
+              {requests.length > 0 ? <RequestList requests={requests} /> : undefined}
+            </Panel>
 
             <div className="grid min-h-0 grid-rows-2 gap-3">
               <Panel
@@ -168,9 +272,11 @@ export default function App() {
               />
             </div>
           </div>
-        ) : (
-          <SettingsView />
         )}
+
+        {view === "library" && <LibraryView />}
+
+        {view === "settings" && <SettingsView />}
       </main>
 
       <footer className="flex shrink-0 items-center gap-4 border-t border-scena-800 bg-scena-900/60 px-3 py-1.5 text-[11px] text-zinc-500">

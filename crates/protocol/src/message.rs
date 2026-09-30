@@ -75,6 +75,33 @@ pub enum RequestStatus {
     Rejected,
 }
 
+impl RequestStatus {
+    /// Postać statusu w bazie i w JSON-ie (`snake_case`). Trzymamy ją w jednym miejscu, żeby
+    /// baza i protokół nie rozjechały się po cichu.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Submitted => "submitted",
+            Self::Approved => "approved",
+            Self::Playing => "playing",
+            Self::Done => "done",
+            Self::Rejected => "rejected",
+        }
+    }
+
+    /// Odczytuje status zapisany w bazie. Nieznana wartość to `None` — wołający decyduje,
+    /// czy to błąd, czy wpis do pominięcia.
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "submitted" => Some(Self::Submitted),
+            "approved" => Some(Self::Approved),
+            "playing" => Some(Self::Playing),
+            "done" => Some(Self::Done),
+            "rejected" => Some(Self::Rejected),
+            _ => None,
+        }
+    }
+}
+
 /// Kod błędu wysyłany do kiosku. Kiosk tłumaczy kod na polski komunikat — teksty nie jadą po sieci.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -310,6 +337,25 @@ mod tests {
         let json = error.to_json().expect("serializacja");
         assert!(json.contains("\"rate_limited\""));
         assert_eq!(error, DjMessage::from_json(&json).expect("deserializacja"));
+    }
+
+    #[test]
+    fn status_round_trips_through_its_text_form() {
+        for status in [
+            RequestStatus::Submitted,
+            RequestStatus::Approved,
+            RequestStatus::Playing,
+            RequestStatus::Done,
+            RequestStatus::Rejected,
+        ] {
+            assert_eq!(RequestStatus::parse(status.as_str()), Some(status));
+
+            let json = serde_json::to_string(&status).expect("serializacja statusu");
+
+            assert_eq!(json, format!("\"{}\"", status.as_str()));
+        }
+
+        assert_eq!(RequestStatus::parse("cokolwiek"), None);
     }
 
     #[test]
