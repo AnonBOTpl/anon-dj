@@ -6,3 +6,9 @@
 
 # Logi uruchomieniowe.
 *.log
+
+# Notatki robocze: plan, dziennik i instrukcje dla agentów zostają na dysku autora,
+# ale nie trafiają do repozytorium.
+/PLAN.md
+/AGENTS.md
+/DEVLOG.md

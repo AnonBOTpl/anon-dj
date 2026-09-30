@@ -5,6 +5,9 @@ mod library;
 mod logging;
 mod net;
 mod settings;
+// Publiczny, bo kontrakt lektora (`TtsProvider`) jest zamierzony jako punkt wejścia dla silników
+// TTS — dopóki nic go nie woła z wewnątrz, prywatny moduł zgłaszałby martwy kod.
+pub mod tts;
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};

@@ -28,10 +28,29 @@ export type Limits = {
   search_query_max_chars: number;
 };
 
+/** Strojenie głosu lektora — zgadza się z typem `VoiceTuning` w `src-tauri/src/tts.rs`. */
+export type VoiceTuning = {
+  /** Tempo mowy w promilach: 1000 = normalne. */
+  length_scale_milli: number;
+  noise_scale_milli: number;
+  noise_w_milli: number;
+  /** Głośność w procentach: 100 = normalna. */
+  volume_percent: number;
+  /** Pauza między zdaniami w milisekundach. */
+  sentence_silence_ms: number;
+};
+
+/** Ustawienia lektora — zgadzają się z typem `TtsSettings` w `src-tauri/src/settings.rs`. */
+export type TtsSettings = {
+  voice: string;
+  tuning: VoiceTuning;
+};
+
 /** Ustawienia DJ-a — zgadzają się z typem `AppSettings` w `src-tauri/src/settings.rs`. */
 export type AppSettings = {
   pin: string;
   port: number;
   confirmation_seconds: number;
   limits: Limits;
+  tts: TtsSettings;
 };

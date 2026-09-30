@@ -860,10 +860,10 @@ mod tests {
 
         let request_columns = columns(&db, "requests");
 
-        for column in ["position", "kiosk_request_id"] {
+        for column in ["position", "kiosk_request_id", "tts_clip_path"] {
             assert!(
                 request_columns.iter().any(|name| name == column),
-                "brak kolumny {column} potrzebnej kolejkom"
+                "brak kolumny {column} potrzebnej kolejkom i lektorowi"
             );
         }
     }

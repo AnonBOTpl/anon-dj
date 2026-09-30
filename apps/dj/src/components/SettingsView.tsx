@@ -32,6 +32,9 @@ export function SettingsView() {
   const [port, setPort] = useState("");
   const [confirmationSeconds, setConfirmationSeconds] = useState("");
   const [values, setValues] = useState<Record<string, string>>({});
+  // Cały wczytany zestaw trzymamy obok pól formularza: zapisywanie wysyła komplet ustawień,
+  // a formularz nie edytuje jeszcze lektora — bez tego zapis kasowałby głos i jego strojenie.
+  const [snapshot, setSnapshot] = useState<AppSettings | null>(null);
   const [busy, setBusy] = useState(false);
   const [saved, setSaved] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -45,6 +48,7 @@ export function SettingsView() {
           return;
         }
 
+        setSnapshot(settings);
         setPin(settings.pin);
         setPort(String(settings.port));
         setConfirmationSeconds(String(settings.confirmation_seconds));
@@ -104,11 +108,18 @@ export function SettingsView() {
       return;
     }
 
+    if (snapshot === null) {
+      setError(ui.settings.loadError);
+
+      return;
+    }
+
     setBusy(true);
 
     try {
       await invoke("save_settings", {
         settings: {
+          ...snapshot,
           pin,
           port: parsedPort,
           confirmation_seconds: parsedConfirmationSeconds,

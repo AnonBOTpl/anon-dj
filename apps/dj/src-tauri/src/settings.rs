@@ -11,6 +11,7 @@ use protocol::{Limits, PIN_LEN, validate_pin};
 use tracing::warn;
 
 use crate::db::{Db, DbError};
+use crate::tts::VoiceTuning;
 
 /// Klucz ustawienia z PIN-em parowania kiosków.
 pub const KEY_PIN: &str = "security.pin";
@@ -24,6 +25,18 @@ pub const KEY_SEARCH_QUERY_MAX_CHARS: &str = "limits.search_query_max_chars";
 pub const KEY_PORT: &str = "server.port";
 /// Klucz ustawienia z czasem powrotu ekranu potwierdzenia w kiosku.
 pub const KEY_CONFIRMATION_SECONDS: &str = "kiosk.confirmation_seconds";
+/// Klucz ustawienia z wybranym głosem lektora dedykacji.
+pub const KEY_TTS_VOICE: &str = "tts.voice";
+/// Klucz ustawienia z tempem mowy lektora.
+pub const KEY_TTS_LENGTH_SCALE: &str = "tts.length_scale";
+/// Klucz ustawienia ze zmiennością barwy lektora.
+pub const KEY_TTS_NOISE_SCALE: &str = "tts.noise_scale";
+/// Klucz ustawienia ze zmiennością rytmu lektora.
+pub const KEY_TTS_NOISE_W: &str = "tts.noise_w";
+/// Klucz ustawienia z głośnością lektora.
+pub const KEY_TTS_VOLUME: &str = "tts.volume";
+/// Klucz ustawienia z pauzą między zdaniami lektora.
+pub const KEY_TTS_SENTENCE_SILENCE: &str = "tts.sentence_silence_ms";
 
 /// PIN, od którego startuje świeża instalacja. DJ może i powinien go zmienić w ustawieniach.
 pub const DEFAULT_PIN: &str = "123456";
@@ -43,6 +56,24 @@ pub const DEFAULT_CONFIRMATION_SECONDS: u32 = 20;
 /// Dopuszczalny zakres czasu powrotu ekranu potwierdzenia. Poniżej 5 s gość nie zdąży
 /// przeczytać, a powyżej 300 s kiosk stoi zablokowany dla kolejnej osoby.
 pub const CONFIRMATION_SECONDS_RANGE: (u32, u32) = (5, 300);
+
+/// Głos lektora, od którego startuje świeża instalacja. To tylko preferencja — jeśli wśród
+/// zainstalowanych głosów go nie ma, aplikacja użyje pierwszego dostępnego (PLAN.md, sekcja 8).
+pub const DEFAULT_TTS_VOICE: &str = "justyna";
+/// Najdłuższa dopuszczalna nazwa głosu.
+pub const TTS_VOICE_MAX_CHARS: usize = 64;
+
+/// Zakres tempa mowy w promilach: 500 = pół tempa, 1000 = normalne, 2000 = dwa razy wolniej.
+/// Powyżej 2000 lektor ciągnie tak, że dedykacja przestaje mieścić się w utworze.
+pub const LENGTH_SCALE_MILLI_RANGE: (u32, u32) = (500, 2_000);
+/// Zakres zmienności barwy (0 = monotomy, 1500 = maksymalna z modeli Piper).
+pub const NOISE_SCALE_MILLI_RANGE: (u32, u32) = (0, 1_500);
+/// Zakres zmienności rytmu.
+pub const NOISE_W_MILLI_RANGE: (u32, u32) = (0, 1_500);
+/// Zakres głośności lektora w procentach (0 = cisza, 200 = dwa razy głośniej).
+pub const VOLUME_PERCENT_RANGE: (u32, u32) = (0, 200);
+/// Zakres pauzy między zdaniami.
+pub const SENTENCE_SILENCE_MS_RANGE: (u32, u32) = (0, 2_000);
 
 /// Dopuszczalny zakres limitu dedykacji. Za krótki ucina gościowi tekst, za długi każe mu czekać
 /// przy kiosku — oba skrajne przypadki szkodzą imprezie.
@@ -68,6 +99,9 @@ pub enum SettingsError {
         max: u32,
         value: u32,
     },
+
+    #[error("nazwa głosu lektora jest nieprawidłowa: „{0}”")]
+    InvalidVoice(String),
 }
 
 impl SettingsError {
@@ -81,6 +115,23 @@ impl SettingsError {
     }
 }
 
+/// Ustawienia lektora: wybrany głos i jego strojenie.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct TtsSettings {
+    /// Identyfikator głosu spośród zainstalowanych lokalnie (np. `justyna`).
+    pub voice: String,
+    pub tuning: VoiceTuning,
+}
+
+impl Default for TtsSettings {
+    fn default() -> Self {
+        Self {
+            voice: DEFAULT_TTS_VOICE.to_string(),
+            tuning: VoiceTuning::default(),
+        }
+    }
+}
+
 /// Efektywne ustawienia aplikacji DJ-a.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct AppSettings {
@@ -90,6 +141,10 @@ pub struct AppSettings {
     /// Po ilu sekundach ekran potwierdzenia w kiosku wraca sam do wyszukiwania.
     pub confirmation_seconds: u32,
     pub limits: Limits,
+    /// Lektor dedykacji. `default` sprawia, że starszy interfejs bez tych pól nadal zapisze
+    /// ustawienia bez błędu.
+    #[serde(default)]
+    pub tts: TtsSettings,
 }
 
 impl Default for AppSettings {
@@ -99,6 +154,7 @@ impl Default for AppSettings {
             port: DEFAULT_PORT,
             confirmation_seconds: DEFAULT_CONFIRMATION_SECONDS,
             limits: Limits::default(),
+            tts: TtsSettings::default(),
         }
     }
 }
@@ -124,6 +180,21 @@ impl AppSettings {
                     .unwrap_or(defaults.limits.guest_name_max_chars),
                 search_query_max_chars: read_u32(db, KEY_SEARCH_QUERY_MAX_CHARS)?
                     .unwrap_or(defaults.limits.search_query_max_chars),
+            },
+            tts: TtsSettings {
+                voice: db.setting(KEY_TTS_VOICE)?.unwrap_or(defaults.tts.voice),
+                tuning: VoiceTuning {
+                    length_scale_milli: read_u32(db, KEY_TTS_LENGTH_SCALE)?
+                        .unwrap_or(defaults.tts.tuning.length_scale_milli),
+                    noise_scale_milli: read_u32(db, KEY_TTS_NOISE_SCALE)?
+                        .unwrap_or(defaults.tts.tuning.noise_scale_milli),
+                    noise_w_milli: read_u32(db, KEY_TTS_NOISE_W)?
+                        .unwrap_or(defaults.tts.tuning.noise_w_milli),
+                    volume_percent: read_u32(db, KEY_TTS_VOLUME)?
+                        .unwrap_or(defaults.tts.tuning.volume_percent),
+                    sentence_silence_ms: read_u32(db, KEY_TTS_SENTENCE_SILENCE)?
+                        .unwrap_or(defaults.tts.tuning.sentence_silence_ms),
+                },
             },
         };
 
@@ -153,6 +224,22 @@ impl AppSettings {
         db.set_setting(
             KEY_SEARCH_QUERY_MAX_CHARS,
             &self.limits.search_query_max_chars.to_string(),
+        )?;
+
+        db.set_setting(KEY_TTS_VOICE, &self.tts.voice)?;
+        db.set_setting(
+            KEY_TTS_LENGTH_SCALE,
+            &self.tts.tuning.length_scale_milli.to_string(),
+        )?;
+        db.set_setting(
+            KEY_TTS_NOISE_SCALE,
+            &self.tts.tuning.noise_scale_milli.to_string(),
+        )?;
+        db.set_setting(KEY_TTS_NOISE_W, &self.tts.tuning.noise_w_milli.to_string())?;
+        db.set_setting(KEY_TTS_VOLUME, &self.tts.tuning.volume_percent.to_string())?;
+        db.set_setting(
+            KEY_TTS_SENTENCE_SILENCE,
+            &self.tts.tuning.sentence_silence_ms.to_string(),
         )?;
 
         Ok(())
@@ -187,8 +274,53 @@ impl AppSettings {
             self.limits.search_query_max_chars,
         )?;
 
+        check_voice(&self.tts.voice)?;
+        check_range(
+            KEY_TTS_LENGTH_SCALE,
+            LENGTH_SCALE_MILLI_RANGE,
+            self.tts.tuning.length_scale_milli,
+        )?;
+        check_range(
+            KEY_TTS_NOISE_SCALE,
+            NOISE_SCALE_MILLI_RANGE,
+            self.tts.tuning.noise_scale_milli,
+        )?;
+        check_range(
+            KEY_TTS_NOISE_W,
+            NOISE_W_MILLI_RANGE,
+            self.tts.tuning.noise_w_milli,
+        )?;
+        check_range(
+            KEY_TTS_VOLUME,
+            VOLUME_PERCENT_RANGE,
+            self.tts.tuning.volume_percent,
+        )?;
+        check_range(
+            KEY_TTS_SENTENCE_SILENCE,
+            SENTENCE_SILENCE_MS_RANGE,
+            self.tts.tuning.sentence_silence_ms,
+        )?;
+
         Ok(())
     }
+}
+
+/// Nazwa głosu musi być identyfikatorem pliku — trafia potem do ścieżek i klucza pamięci
+/// podręcznej, więc nie może zawierać spacji ani separatorów.
+fn check_voice(voice: &str) -> Result<(), SettingsError> {
+    let voice = voice.trim();
+
+    let looks_like_id = !voice.is_empty()
+        && voice.chars().count() <= TTS_VOICE_MAX_CHARS
+        && voice
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '_' | '-'));
+
+    if !looks_like_id {
+        return Err(SettingsError::InvalidVoice(voice.to_string()));
+    }
+
+    Ok(())
 }
 
 fn check_port(port: u16) -> Result<(), SettingsError> {
@@ -247,6 +379,7 @@ fn read_u32(db: &Db, key: &str) -> Result<Option<u32>, SettingsError> {
 mod tests {
     use super::*;
     use crate::db::Db;
+    use crate::tts::VoiceTuning;
 
     #[test]
     fn defaults_are_valid_and_match_protocol_limits() {
@@ -284,11 +417,106 @@ mod tests {
                 guest_name_max_chars: 25,
                 search_query_max_chars: 60,
             },
+            tts: TtsSettings {
+                voice: "pl_PL-jarvis_wg_glos-medium".to_string(),
+                tuning: VoiceTuning {
+                    length_scale_milli: 1_100,
+                    noise_scale_milli: 700,
+                    noise_w_milli: 750,
+                    volume_percent: 90,
+                    sentence_silence_ms: 150,
+                },
+            },
         };
 
         settings.save(&db).expect("zapis ustawień");
 
         assert_eq!(AppSettings::load(&db).expect("odczyt ustawień"), settings);
+    }
+
+    #[test]
+    fn tts_defaults_are_valid_and_pick_a_voice() {
+        let settings = AppSettings::default();
+
+        assert!(settings.validate().is_ok());
+        assert_eq!(settings.tts.voice, DEFAULT_TTS_VOICE);
+        assert_eq!(settings.tts.tuning, VoiceTuning::default());
+    }
+
+    #[test]
+    fn tts_tuning_outside_the_allowed_range_is_rejected() {
+        let db = Db::open_in_memory().expect("baza w pamięci");
+
+        let too_slow = AppSettings {
+            tts: TtsSettings {
+                tuning: VoiceTuning {
+                    length_scale_milli: 100,
+                    ..VoiceTuning::default()
+                },
+                ..TtsSettings::default()
+            },
+            ..AppSettings::default()
+        };
+
+        assert!(matches!(
+            too_slow.validate(),
+            Err(SettingsError::OutOfRange {
+                key: KEY_TTS_LENGTH_SCALE,
+                ..
+            })
+        ));
+        assert!(matches!(
+            too_slow.save(&db),
+            Err(SettingsError::OutOfRange {
+                key: KEY_TTS_LENGTH_SCALE,
+                ..
+            })
+        ));
+
+        db.set_setting(KEY_TTS_VOLUME, "500").expect("zapis");
+
+        assert!(matches!(
+            AppSettings::load(&db),
+            Err(SettingsError::OutOfRange {
+                key: KEY_TTS_VOLUME,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn an_invalid_voice_name_is_rejected() {
+        let settings = AppSettings {
+            tts: TtsSettings {
+                voice: "justyna/../wzorowy".to_string(),
+                ..TtsSettings::default()
+            },
+            ..AppSettings::default()
+        };
+
+        assert!(matches!(
+            settings.validate(),
+            Err(SettingsError::InvalidVoice(_))
+        ));
+    }
+
+    #[test]
+    fn an_older_interface_without_tts_fields_still_saves() {
+        let settings: AppSettings = serde_json::from_str(
+            r#"{
+                "pin": "123456",
+                "port": 8790,
+                "confirmation_seconds": 20,
+                "limits": {
+                    "dedication_max_chars": 400,
+                    "guest_name_max_chars": 40,
+                    "search_query_max_chars": 80
+                }
+            }"#,
+        )
+        .expect("starszy interfejs bez pól TTS");
+
+        assert_eq!(settings.tts, TtsSettings::default());
     }
 
     #[test]
