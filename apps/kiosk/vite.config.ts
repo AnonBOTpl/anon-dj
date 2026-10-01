@@ -14,15 +14,18 @@ export default defineConfig(() => ({
   // 1. prevent Vite from obscuring rust errors
   clearScreen: false,
   // 2. tauri expects a fixed port, fail if that port is not available
+  //
+  // Kiosk stoi na innym porcie niż aplikacja DJ-a (1420/1421), bo DJ uruchamia oba
+  // `tauri dev` naraz — na wspólnym porcie drugi start przewracałby się o zajęty port.
   server: {
-    port: 1420,
+    port: 1430,
     strictPort: true,
     host: host || false,
     hmr: host
       ? {
           protocol: "ws",
           host,
-          port: 1421,
+          port: 1431,
         }
       : undefined,
     watch: {
