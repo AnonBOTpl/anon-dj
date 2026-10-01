@@ -179,7 +179,9 @@ impl KioskMessage {
 
                 Ok(())
             }
-            Self::Search { query, .. } => {
+            // Podpowiedzi walidujemy tak samo jak wyszukiwanie: to ta sama fraza i te same
+            // limity, a osobny komunikat wynika z osobnego budżetu tempa, nie z innych reguł.
+            Self::Search { query, .. } | Self::Suggest { query, .. } => {
                 validate_search_query_with(query, limits.search_query_max_chars as usize)?;
 
                 Ok(())
@@ -373,6 +375,21 @@ mod tests {
         };
 
         assert_eq!(message.validate(), Err(ValidationError::EmptySearchQuery));
+    }
+
+    #[test]
+    fn suggest_message_validates_the_same_query_rules_as_search() {
+        let empty = KioskMessage::Suggest {
+            request_id: 1,
+            query: "  ".to_string(),
+        };
+        assert_eq!(empty.validate(), Err(ValidationError::EmptySearchQuery));
+
+        let normalized = KioskMessage::Suggest {
+            request_id: 1,
+            query: " Kombi ".to_string(),
+        };
+        assert_eq!(normalized.validate(), Ok(()));
     }
 
     #[test]

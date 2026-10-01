@@ -17,8 +17,8 @@ use std::time::{Duration, Instant};
 use futures_util::{SinkExt, StreamExt};
 use protocol::{
     DjMessage, ErrorCode, KioskMessage, Limits, MAX_KIOSK_NAME_CHARS, MAX_SEARCH_RESULTS,
-    PROTOCOL_VERSION, RequestStatus, count_chars, normalize_text, validate_dedication_with,
-    validate_guest_name_with,
+    MAX_SUGGESTIONS, PROTOCOL_VERSION, RequestStatus, count_chars, normalize_text,
+    validate_dedication_with, validate_guest_name_with,
 };
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, watch};
@@ -48,6 +48,14 @@ const PAIRING_TIMEOUT: Duration = Duration::from_secs(10);
 const RATE_MAX_MESSAGES: usize = 30;
 /// Długość okna limitera tempa.
 const RATE_WINDOW: Duration = Duration::from_secs(10);
+
+/// Osobny limit tempa dla podpowiedzi na żywo, w tym samym oknie [`RATE_WINDOW`].
+///
+/// Podpowiedzi lecą przy każdym zatrzymaniu pisania (kiosk odsiewa je co ~200 ms), więc muszą mieć
+/// **własny budżet**: na wspólnym limicie piszący gość zajechałby limit przeznaczony na zgłoszenia,
+/// a wtedy prawdziwa prośba zostałaby odrzucona. Wartość jest wyższa od [`RATE_MAX_MESSAGES`],
+/// ale wciąż ogranicza tempo zapytań do bazy.
+const SUGGEST_RATE_MAX_MESSAGES: usize = 60;
 
 /// Przez ile czasu identyczna prośba z tego samego kiosku jest uznawana za duplikat
 /// (ochrona przed podwójnym kliknięciem „Wyślij”).
@@ -88,6 +96,8 @@ struct State {
     /// Licznik numerów połączeń.
     next_session: u64,
     limiter: RateLimiter,
+    /// Osobny licznik tempa dla podpowiedzi — patrz [`SUGGEST_RATE_MAX_MESSAGES`].
+    suggest_limiter: RateLimiter,
     /// Czy nasłuch faktycznie działa. Zajęty port to najczęstsza przyczyna „kiosk się nie łączy”,
     /// więc DJ musi to widzieć w interfejsie, a nie tylko w logu.
     listening: bool,
@@ -107,7 +117,11 @@ impl Server {
             db,
             settings,
             ui_events,
-            state: Mutex::new(State::default()),
+            state: Mutex::new(State {
+                // Podpowiedzi mają własny, większy budżet niż pozostałe komunikaty.
+                suggest_limiter: RateLimiter::new(SUGGEST_RATE_MAX_MESSAGES, RATE_WINDOW),
+                ..State::default()
+            }),
             desired_port,
         })
     }
@@ -482,7 +496,14 @@ impl Server {
             return true;
         }
 
-        if !self.allow_message(kiosk_id) {
+        // Podpowiedzi mają własny budżet, żeby piszący gość nie zjadł limitu na zgłoszenia.
+        let allowed = if matches!(message, KioskMessage::Suggest { .. }) {
+            self.allow_suggestion(kiosk_id)
+        } else {
+            self.allow_message(kiosk_id)
+        };
+
+        if !allowed {
             warn!(kiosk_id, "kiosk przekroczył limit tempa");
 
             send(
@@ -503,6 +524,11 @@ impl Server {
             }
             KioskMessage::Search { request_id, query } => {
                 self.handle_search(request_id, &query, sink).await;
+
+                true
+            }
+            KioskMessage::Suggest { request_id, query } => {
+                self.handle_suggest(request_id, &query, sink).await;
 
                 true
             }
@@ -560,6 +586,45 @@ impl Server {
             }
             Err(error) => {
                 warn!(request_id, error = %error, "wyszukiwanie dla kiosku nie powiodło się");
+
+                send(sink, &error_message(Some(request_id), ErrorCode::Internal)).await;
+            }
+        }
+    }
+
+    /// Podpowiedzi dla frazy, którą gość właśnie pisze.
+    ///
+    /// Ta sama ścieżka co wyszukiwanie, tylko krótsza lista — gość ma zobaczyć kilka propozycji,
+    /// a nie cały katalog. Osobny budżet tempa pilnuje [`Server::allow_suggestion`].
+    async fn handle_suggest(&self, request_id: u64, query: &str, sink: &mut WsSink) {
+        let query = match normalize_text(query) {
+            Ok(query) if !query.is_empty() => query,
+            // Puste zapytanie nie jest błędem gościa — po prostu nie ma czego podpowiadać.
+            _ => {
+                send(
+                    sink,
+                    &DjMessage::Suggestions {
+                        request_id,
+                        tracks: Vec::new(),
+                    },
+                )
+                .await;
+
+                return;
+            }
+        };
+
+        let db = Arc::clone(&self.db);
+        let search = db_call(move || db.search_tracks(&query, MAX_SUGGESTIONS as u32)).await;
+
+        match search {
+            Ok(tracks) => {
+                let results = DjMessage::Suggestions { request_id, tracks };
+
+                send(sink, &results).await;
+            }
+            Err(error) => {
+                warn!(request_id, error = %error, "podpowiedzi dla kiosku nie powiodły się");
 
                 send(sink, &error_message(Some(request_id), ErrorCode::Internal)).await;
             }
@@ -749,6 +814,15 @@ impl Server {
         }
     }
 
+    /// To samo dla podpowiedzi, ale z osobnego licznika — dzięki temu pisanie nie zjada limitu
+    /// przeznaczonego na zgłoszenia (PLAN.md, sekcja 11).
+    fn allow_suggestion(&self, kiosk_id: i64) -> bool {
+        match self.state.lock() {
+            Ok(mut state) => state.suggest_limiter.allow(kiosk_id, Instant::now()),
+            Err(_) => false,
+        }
+    }
+
     /// Rejestruje kiosk razem z kanałem, którym można się do niego odezwać bez pytania.
     ///
     /// Zwraca numer tego połączenia. Kiosk, który łączy się ponownie, dostaje nowy numer,
@@ -792,6 +866,7 @@ impl Server {
                 state.outboxes.remove(&kiosk_id);
                 // Historia tempa nie jest już potrzebna — kiosk przyjdzie od nowa.
                 state.limiter.forget(kiosk_id);
+                state.suggest_limiter.forget(kiosk_id);
             }
             Err(_) => return,
         };
@@ -1140,6 +1215,74 @@ mod tests {
                 })
             ),
             "kiosk dostaje status prośby, którą sam oznaczył numerem 2"
+        );
+    }
+
+    #[tokio::test]
+    async fn live_suggestions_do_not_eat_the_normal_rate_limit() {
+        let db = Arc::new(Db::open_in_memory().expect("baza w pamięci"));
+
+        db.upsert_track(&TrackRecord::new(
+            "C:\\muzyka\\kombi.mp3".to_string(),
+            "Słodkiego, miłego życia".to_string(),
+            "Kombi".to_string(),
+            None,
+            Some(255_000),
+        ))
+        .expect("utwór w bibliotece");
+
+        let port = free_port();
+        let (_server, _events) = start_server(&db, port);
+
+        let mut ws = connect(port).await;
+        send_message(&mut ws, &hello(DEFAULT_PIN)).await;
+        assert!(matches!(
+            next_message(&mut ws).await,
+            Some(DjMessage::HelloOk { .. })
+        ));
+
+        // Więcej podpowiedzi, niż wynosi limit zwykłych komunikatów na kiosk. Każda z nich ma
+        // przejść — piszący gość nie może zostać uciszony.
+        for id in 0..(RATE_MAX_MESSAGES as u64 + 5) {
+            send_message(
+                &mut ws,
+                &KioskMessage::Suggest {
+                    request_id: 1_000 + id,
+                    query: "kombi".to_string(),
+                },
+            )
+            .await;
+
+            match next_message(&mut ws)
+                .await
+                .expect("brak odpowiedzi na podpowiedź")
+            {
+                DjMessage::Suggestions { tracks, .. } => {
+                    assert!(
+                        tracks.len() <= MAX_SUGGESTIONS,
+                        "za długa lista podpowiedzi"
+                    );
+                }
+                other => panic!("podpowiedź odrzucona: {other:?}"),
+            }
+        }
+
+        // Kluczowe: mimo tylu podpowiedzi pełne wyszukiwanie musi nadal przejść.
+        send_message(
+            &mut ws,
+            &KioskMessage::Search {
+                request_id: 9_000,
+                query: "kombi".to_string(),
+            },
+        )
+        .await;
+
+        assert!(
+            matches!(
+                next_message(&mut ws).await,
+                Some(DjMessage::SearchResults { .. })
+            ),
+            "podpowiedzi zjadły limit przeznaczony na wyszukiwanie"
         );
     }
 

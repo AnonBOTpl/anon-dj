@@ -98,6 +98,12 @@ pub enum UiEvent {
         request_id: u64,
         tracks: Vec<TrackInfo>,
     },
+    /// Podpowiedzi dla pisanej frazy — osobne zdarzenie, bo interfejs inaczej je obsługuje
+    /// (nie gasi listy, tylko ją podmienia).
+    Suggestions {
+        request_id: u64,
+        tracks: Vec<TrackInfo>,
+    },
     RequestReceived {
         request_id: u64,
         status: RequestStatus,
@@ -209,6 +215,18 @@ impl Client {
         let request_id = self.next_request_id()?;
 
         self.send(KioskMessage::Search { request_id, query })?;
+
+        Ok(request_id)
+    }
+
+    /// Wysyła prośbę o podpowiedzi dla pisanej frazy i zwraca identyfikator odpowiedzi.
+    ///
+    /// Osobny komunikat od wyszukiwania, bo po stronie DJ-a ma własny budżet tempa — inaczej
+    /// piszący gość zjadłby limit przeznaczony na zgłoszenia (PLAN.md, sekcja 11).
+    pub fn suggest(&self, query: String) -> Result<u64, ClientError> {
+        let request_id = self.next_request_id()?;
+
+        self.send(KioskMessage::Suggest { request_id, query })?;
 
         Ok(request_id)
     }
@@ -408,6 +426,9 @@ impl Client {
         match message {
             DjMessage::SearchResults { request_id, tracks } => {
                 self.emit(UiEvent::SearchResults { request_id, tracks });
+            }
+            DjMessage::Suggestions { request_id, tracks } => {
+                self.emit(UiEvent::Suggestions { request_id, tracks });
             }
             DjMessage::RequestReceived { request_id, status } => {
                 self.emit(UiEvent::RequestReceived { request_id, status });

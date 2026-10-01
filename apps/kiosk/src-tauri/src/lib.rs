@@ -20,6 +20,8 @@ use crate::net::{Client, ConnectionState, ServerConfig, UiEvent};
 const EVENT_CONNECTION: &str = "kiosk://connection";
 /// Zdarzenie z wynikami wyszukiwania.
 const EVENT_SEARCH_RESULTS: &str = "kiosk://search-results";
+/// Zdarzenie z podpowiedziami dla pisanej frazy (osobne od wyników wyszukiwania).
+const EVENT_SUGGESTIONS: &str = "kiosk://suggestions";
 /// Zdarzenie o statusie wysłanej prośby.
 const EVENT_REQUEST_STATUS: &str = "kiosk://request-status";
 /// Zdarzenie z błędem zwróconym przez aplikację DJ-a.
@@ -32,7 +34,7 @@ struct AppStatus {
     protocol_version: u16,
 }
 
-/// Wyniki wyszukiwania przekazywane do interfejsu.
+/// Wyniki wyszukiwania (albo podpowiedzi — kształt jest ten sam) przekazywane do interfejsu.
 #[derive(Debug, Clone, serde::Serialize)]
 struct SearchResultsPayload {
     request_id: u64,
@@ -85,6 +87,15 @@ fn search(client: tauri::State<'_, Arc<Client>>, query: String) -> Result<u64, S
     client.search(query).map_err(|error| error.to_string())
 }
 
+/// Wysyła prośbę o podpowiedzi. Odpowiedź przyjdzie zdarzeniem `kiosk://suggestions`.
+///
+/// Podpowiedzi mają osobny budżet tempa po stronie DJ-a, więc pisanie nie zjada limitu
+/// przeznaczonego na zgłoszenia (PLAN.md, sekcja 11).
+#[tauri::command(rename_all = "snake_case")]
+fn suggest(client: tauri::State<'_, Arc<Client>>, query: String) -> Result<u64, String> {
+    client.suggest(query).map_err(|error| error.to_string())
+}
+
 /// Wysyła prośbę gościa. Odpowiedź przyjdzie zdarzeniem `kiosk://request-status`.
 #[tauri::command(rename_all = "snake_case")]
 fn submit_request(
@@ -107,6 +118,11 @@ fn spawn_ui_forwarder(app: tauri::AppHandle, mut events: mpsc::UnboundedReceiver
                 UiEvent::SearchResults { request_id, tracks } => emit(
                     &app,
                     EVENT_SEARCH_RESULTS,
+                    SearchResultsPayload { request_id, tracks },
+                ),
+                UiEvent::Suggestions { request_id, tracks } => emit(
+                    &app,
+                    EVENT_SUGGESTIONS,
                     SearchResultsPayload { request_id, tracks },
                 ),
                 UiEvent::RequestReceived { request_id, status } => emit(
@@ -163,6 +179,7 @@ pub fn run() {
             connect,
             disconnect,
             search,
+            suggest,
             submit_request
         ])
         .run(tauri::generate_context!())

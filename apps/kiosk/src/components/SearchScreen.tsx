@@ -13,7 +13,11 @@ type SearchScreenProps = {
   message: string | null;
   onQueryChange: (value: string) => void;
   onSearch: () => void;
+  /** Enter: wybiera pierwszą podpowiedź, a gdy jej nie ma — szuka jak zwykłe wyszukiwanie. */
+  onEnter: () => void;
   onSelect: (track: TrackInfo) => void;
+  /** Limit frazy ustawiony przez DJ-a — pole nie pozwala wpisać więcej. */
+  maxQueryChars: number;
 };
 
 /** Ekran wyszukiwania: duże pole, duże przyciski, cała lista jednym kliknięciem. */
@@ -25,7 +29,9 @@ export function SearchScreen({
   message,
   onQueryChange,
   onSearch,
+  onEnter,
   onSelect,
+  maxQueryChars,
 }: SearchScreenProps) {
   return (
     <div className="flex h-full flex-col items-center gap-8 px-16 py-12">
@@ -37,21 +43,25 @@ export function SearchScreen({
       <form
         className="flex w-full max-w-3xl gap-4"
         onSubmit={(event) => {
+          // Enter = pierwsza podpowiedź. Przycisk „Szukaj” zostaje na pełne wyszukiwanie,
+          // więc musi być osobnego typu — inaczej klikałby to samo co Enter.
           event.preventDefault();
-          onSearch();
+          onEnter();
         }}
       >
         <input
           type="text"
           autoFocus
           value={query}
+          maxLength={maxQueryChars}
           placeholder={ui.search.placeholder}
           onChange={(event) => onQueryChange(event.currentTarget.value)}
           className="h-16 flex-1 rounded-2xl border border-scena-700 bg-scena-950 px-6 text-xl text-zinc-200 outline-none placeholder:text-zinc-600 focus:border-zinc-500"
         />
 
         <button
-          type="submit"
+          type="button"
+          onClick={onSearch}
           disabled={searching || query.trim() === ""}
           className="flex h-16 items-center gap-3 rounded-2xl bg-zinc-100 px-8 text-xl font-semibold text-scena-950 transition-colors hover:bg-white disabled:opacity-50"
         >

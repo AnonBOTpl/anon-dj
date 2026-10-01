@@ -13,6 +13,7 @@ import type { ConnectionState, ErrorCode, RequestStatus, TrackInfo } from "./typ
 /** Zdarzenia wysyłane przez warstwę Rust (nazwy muszą zgadzać się ze stałymi w `src-tauri`). */
 const EVENT_CONNECTION = "kiosk://connection";
 const EVENT_SEARCH_RESULTS = "kiosk://search-results";
+const EVENT_SUGGESTIONS = "kiosk://suggestions";
 const EVENT_REQUEST_STATUS = "kiosk://request-status";
 const EVENT_ERROR = "kiosk://error";
 
@@ -24,6 +25,18 @@ type Screen = "search" | "dedication" | "sent";
 
 /** Zapasowy czas powrotu ekranu potwierdzenia, gdy aplikacja DJ-a go nie przysłała. */
 const FALLBACK_CONFIRMATION_SECONDS = 20;
+
+/**
+ * Co ile najwyżej wysyłamy podpowiedzi. Bez tego każde wciśnięcie klawisza byłoby osobnym
+ * zapytaniem do bazy DJ-a (PLAN.md, sekcja 11).
+ */
+const SUGGEST_DEBOUNCE_MS = 200;
+
+/**
+ * Od ilu znaków pytamy o podpowiedzi. Jedna litera pasuje do połowy biblioteki — lista byłaby
+ * długa, wolna i niczego nie zawężała.
+ */
+const MIN_SUGGEST_QUERY_CHARS = 2;
 
 /** Komunikat dla gościa. Kody błędów z sieci tłumaczymy tutaj — po sieci nie jadą teksty. */
 function errorText(code: ErrorCode): string {
@@ -55,6 +68,7 @@ export default function App() {
 
   // Identyfikatory trzymamy w referencjach: nasłuchy nie mogą się przepinać przy każdej zmianie.
   const searchRequestId = useRef<number | null>(null);
+  const suggestRequestId = useRef<number | null>(null);
   const sentRequestId = useRef<number | null>(null);
 
   useEffect(() => {
@@ -98,6 +112,17 @@ export default function App() {
       setHasSearched(true);
     });
 
+    // Nieaktualne podpowiedzi odrzucamy po identyfikatorze — inaczej odpowiedź na starszą frazę
+    // podmieniłaby listę pod palcem gościa.
+    const unlistenSuggestions = listen<SearchResultsPayload>(EVENT_SUGGESTIONS, (event) => {
+      if (event.payload.request_id !== suggestRequestId.current) {
+        return;
+      }
+
+      setResults(event.payload.tracks);
+      setHasSearched(true);
+    });
+
     const unlistenStatus = listen<RequestStatusPayload>(EVENT_REQUEST_STATUS, (event) => {
       if (event.payload.request_id !== sentRequestId.current) {
         return;
@@ -116,10 +141,52 @@ export default function App() {
 
     return () => {
       void unlistenResults.then((stop) => stop());
+      void unlistenSuggestions.then((stop) => stop());
       void unlistenStatus.then((stop) => stop());
       void unlistenError.then((stop) => stop());
     };
   }, []);
+
+  // Podpowiedzi na żywo: gość pisze, a lista sama się zawęża — nie musi klikać „Szukaj”
+  // (PLAN.md, sekcja 11). Wysyłamy je dopiero po pauzie w pisaniu.
+  useEffect(() => {
+    if (connection.state !== "connected" || screen !== "search") {
+      return;
+    }
+
+    const trimmed = query.trim();
+
+    if (trimmed.length < MIN_SUGGEST_QUERY_CHARS) {
+      // Za krótka fraza — wracamy do pustej listy zamiast pokazywać przypadkowe trafienia.
+      setResults([]);
+      setHasSearched(false);
+
+      return;
+    }
+
+    let active = true;
+
+    const timer = window.setTimeout(() => {
+      // Porzucamy ewentualne wcześniejsze wyszukiwanie: jego odpowiedź nie może już podmienić
+      // listy, bo gość od tego czasu dopisał literę.
+      searchRequestId.current = null;
+
+      void invoke<number>("suggest", { query: trimmed })
+        .then((requestId) => {
+          if (active) {
+            suggestRequestId.current = requestId;
+          }
+        })
+        .catch(() => {
+          // Podpowiedzi to wygoda — brak odpowiedzi nie może pokazać gościowi błędu.
+        });
+    }, SUGGEST_DEBOUNCE_MS);
+
+    return () => {
+      active = false;
+      window.clearTimeout(timer);
+    };
+  }, [query, screen, connection.state]);
 
   /* Czas powrotu ustawia DJ w swojej aplikacji — kiosk dostaje go przy parowaniu. */
   const confirmationSeconds =
@@ -184,6 +251,9 @@ export default function App() {
     setMessage(null);
     setResults([]);
     setSearching(true);
+    // Pełne wyszukiwanie unieważnia podpowiedzi, które jeszcze lecą — inaczej spóźniona
+    // odpowiedź na starszą frazę nadpisałaby jego wyniki.
+    suggestRequestId.current = null;
 
     try {
       const requestId = await invoke<number>("search", { query });
@@ -192,6 +262,30 @@ export default function App() {
       setSearching(false);
       setMessage(String(reason));
     }
+  }
+
+  function handleSelect(track: TrackInfo) {
+    setSelected(track);
+    setMessage(null);
+    setScreen("dedication");
+  }
+
+  /// Enter wybiera pierwszą podpowiedź — gość nie ma celować kursorem w listę.
+  /// Gdy podpowiedzi nie ma (za krótka fraza albo nic nie pasuje), Enter szuka jak dotąd.
+  function handleEnter() {
+    if (query.trim() === "") {
+      return;
+    }
+
+    const first = results[0];
+
+    if (first !== undefined) {
+      handleSelect(first);
+
+      return;
+    }
+
+    void handleSearch();
   }
 
   async function handleSubmit() {
@@ -224,6 +318,7 @@ export default function App() {
     setDedication("");
     setGuestName("");
     setMessage(null);
+    suggestRequestId.current = null;
     sentRequestId.current = null;
   }
 
@@ -251,13 +346,11 @@ export default function App() {
           searching={searching}
           hasSearched={hasSearched}
           message={message}
+          maxQueryChars={connection.limits.search_query_max_chars}
           onQueryChange={setQuery}
           onSearch={() => void handleSearch()}
-          onSelect={(track) => {
-            setSelected(track);
-            setMessage(null);
-            setScreen("dedication");
-          }}
+          onEnter={handleEnter}
+          onSelect={handleSelect}
         />
       )}
 

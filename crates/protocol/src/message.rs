@@ -24,6 +24,10 @@ pub const MAX_SEARCH_QUERY_CHARS: usize = 80;
 /// Maksymalna liczba utworów w jednej odpowiedzi na wyszukiwanie.
 pub const MAX_SEARCH_RESULTS: usize = 50;
 
+/// Maksymalna liczba utworów w jednej odpowiedzi na podpowiedź (podpowiedzi na żywo).
+/// Mniej niż w wyszukiwaniu: lista pojawia się pod palcem gościa, więc ma być krótka i czytelna.
+pub const MAX_SUGGESTIONS: usize = 8;
+
 /// Maksymalna długość nazwy kiosku podawanej przy łączeniu.
 pub const MAX_KIOSK_NAME_CHARS: usize = 40;
 
@@ -131,6 +135,12 @@ pub enum KioskMessage {
     },
     /// Wyszukanie utworu w katalogu DJ-a.
     Search { request_id: u64, query: String },
+    /// Podpowiedzi dla frazy, którą gość właśnie pisze.
+    ///
+    /// Osobny komunikat, bo ma **własny budżet tempa**: podpowiedzi lecą przy każdym zatrzymaniu
+    /// pisania i nie mogą zjadać limitu przewidzianego na pełne wyszukiwania i zgłoszenia
+    /// (PLAN.md, sekcja 11).
+    Suggest { request_id: u64, query: String },
     /// Zgłoszenie prośby: utwór, dedykacja, opcjonalne imię gościa.
     SubmitRequest {
         request_id: u64,
@@ -157,6 +167,11 @@ pub enum DjMessage {
     },
     /// Wyniki wyszukiwania (tylko metadane).
     SearchResults {
+        request_id: u64,
+        tracks: Vec<TrackInfo>,
+    },
+    /// Podpowiedzi dla pisanej frazy (tylko metadane).
+    Suggestions {
         request_id: u64,
         tracks: Vec<TrackInfo>,
     },
@@ -206,9 +221,9 @@ impl KioskMessage {
     pub fn request_id(&self) -> Option<u64> {
         match self {
             Self::Hello { .. } => None,
-            Self::Search { request_id, .. } | Self::SubmitRequest { request_id, .. } => {
-                Some(*request_id)
-            }
+            Self::Search { request_id, .. }
+            | Self::Suggest { request_id, .. }
+            | Self::SubmitRequest { request_id, .. } => Some(*request_id),
         }
     }
 }
@@ -280,6 +295,41 @@ mod tests {
         let parsed = KioskMessage::from_json(&json).expect("deserializacja");
 
         assert_eq!(message, parsed);
+    }
+
+    #[test]
+    fn kiosk_suggest_round_trip() {
+        let message = KioskMessage::Suggest {
+            request_id: 12,
+            query: "Komb".to_string(),
+        };
+
+        let json = message.to_json().expect("serializacja");
+        let parsed = KioskMessage::from_json(&json).expect("deserializacja");
+
+        assert_eq!(message, parsed);
+        assert_eq!(parsed.request_id(), Some(12));
+        assert!(json.contains("\"type\":\"suggest\""), "{json}");
+    }
+
+    #[test]
+    fn dj_suggestions_round_trip() {
+        let message = DjMessage::Suggestions {
+            request_id: 12,
+            tracks: vec![TrackInfo {
+                id: 1,
+                title: "Kombi".to_string(),
+                artist: "Kombi".to_string(),
+                album: None,
+                duration_ms: None,
+            }],
+        };
+
+        let json = message.to_json().expect("serializacja");
+        let parsed = DjMessage::from_json(&json).expect("deserializacja");
+
+        assert_eq!(message, parsed);
+        assert!(json.contains("\"type\":\"suggestions\""), "{json}");
     }
 
     #[test]
