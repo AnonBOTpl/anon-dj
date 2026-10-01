@@ -6,6 +6,7 @@ import {
   Disc3,
   Library,
   ListChecks,
+  Mic,
   Server,
   Settings,
   TriangleAlert,
@@ -17,6 +18,7 @@ import { LibraryView } from "./components/LibraryView";
 import { QueuesView } from "./components/QueuesView";
 import { SettingsView } from "./components/SettingsView";
 import { TitleBar } from "./components/TitleBar";
+import { VoiceView } from "./components/VoiceView";
 import { ui } from "./text";
 
 /** Odpowiedź komendy `app_status` z warstwy Rust. */
@@ -39,7 +41,7 @@ type ServerStatus = {
 /** Zdarzenie o zmianie stanu serwera kiosków. */
 const EVENT_KIOSK_STATUS = "kiosk://status";
 
-type View = "queues" | "library" | "settings";
+type View = "queues" | "library" | "voice" | "settings";
 
 type ChipTone = "neutral" | "warning" | "danger";
 
@@ -213,6 +215,12 @@ export default function App() {
             onClick={() => setView("library")}
           />
           <NavButton
+            active={view === "voice"}
+            icon={<Mic className="h-4 w-4" />}
+            label={ui.nav.voice}
+            onClick={() => setView("voice")}
+          />
+          <NavButton
             active={view === "settings"}
             icon={<Settings className="h-4 w-4" />}
             label={ui.nav.settings}
@@ -225,6 +233,8 @@ export default function App() {
         {view === "queues" && <QueuesView />}
 
         {view === "library" && <LibraryView />}
+
+        {view === "voice" && <VoiceView />}
 
         {view === "settings" && <SettingsView />}
       </main>

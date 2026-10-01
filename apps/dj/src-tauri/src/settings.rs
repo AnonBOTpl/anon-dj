@@ -304,37 +304,40 @@ impl AppSettings {
             self.limits.search_query_max_chars,
         )?;
 
-        check_voice(&self.tts.voice)?;
-        check_range(
-            KEY_TTS_LENGTH_SCALE,
-            LENGTH_SCALE_MILLI_RANGE,
-            self.tts.tuning.length_scale_milli,
-        )?;
-        check_range(
-            KEY_TTS_NOISE_SCALE,
-            NOISE_SCALE_MILLI_RANGE,
-            self.tts.tuning.noise_scale_milli,
-        )?;
-        check_range(
-            KEY_TTS_NOISE_W,
-            NOISE_W_MILLI_RANGE,
-            self.tts.tuning.noise_w_milli,
-        )?;
-        check_range(
-            KEY_TTS_VOLUME,
-            VOLUME_PERCENT_RANGE,
-            self.tts.tuning.volume_percent,
-        )?;
-        check_range(
-            KEY_TTS_SENTENCE_SILENCE,
-            SENTENCE_SILENCE_MS_RANGE,
-            self.tts.tuning.sentence_silence_ms,
-        )?;
+        validate_tts(&self.tts.voice, &self.tts.tuning)?;
 
         check_audio_device(&self.audio.output_device_id)?;
 
         Ok(())
     }
+}
+
+/// Sprawdza sam wybór głosu i jego strojenie.
+///
+/// Wydzielone, bo ekran lektora odsłuchuje próbkę **przed** zapisem: podgląd musi odrzucić
+/// głos albo wartość spoza zakresu tym samym kodem, co zapis ustawień — inaczej dałoby się
+/// posłuchać czegoś, czego potem nie da się zapisać.
+pub fn validate_tts(voice: &str, tuning: &VoiceTuning) -> Result<(), SettingsError> {
+    check_voice(voice)?;
+    check_range(
+        KEY_TTS_LENGTH_SCALE,
+        LENGTH_SCALE_MILLI_RANGE,
+        tuning.length_scale_milli,
+    )?;
+    check_range(
+        KEY_TTS_NOISE_SCALE,
+        NOISE_SCALE_MILLI_RANGE,
+        tuning.noise_scale_milli,
+    )?;
+    check_range(KEY_TTS_NOISE_W, NOISE_W_MILLI_RANGE, tuning.noise_w_milli)?;
+    check_range(KEY_TTS_VOLUME, VOLUME_PERCENT_RANGE, tuning.volume_percent)?;
+    check_range(
+        KEY_TTS_SENTENCE_SILENCE,
+        SENTENCE_SILENCE_MS_RANGE,
+        tuning.sentence_silence_ms,
+    )?;
+
+    Ok(())
 }
 
 /// Identyfikator urządzenia wyjściowego trafia prosto do interfejsu audio, więc ograniczamy jego
@@ -566,6 +569,30 @@ mod tests {
             AppSettings::load(&db),
             Err(SettingsError::OutOfRange {
                 key: KEY_TTS_VOLUME,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn the_preview_validates_the_voice_and_tuning_like_a_save_does() {
+        let tuning = VoiceTuning::default();
+
+        assert!(validate_tts("justyna", &tuning).is_ok());
+        assert!(matches!(
+            validate_tts("justyna/../wzorowy", &tuning),
+            Err(SettingsError::InvalidVoice(_))
+        ));
+
+        let too_fast = VoiceTuning {
+            length_scale_milli: 5_000,
+            ..tuning
+        };
+
+        assert!(matches!(
+            validate_tts("justyna", &too_fast),
+            Err(SettingsError::OutOfRange {
+                key: KEY_TTS_LENGTH_SCALE,
                 ..
             })
         ));

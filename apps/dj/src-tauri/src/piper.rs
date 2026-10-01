@@ -326,12 +326,14 @@ impl PiperTts {
 }
 
 /// Stan lektora w aplikacji: gotowy provider albo powód, dla którego go nie ma.
-#[derive(Clone)]
 pub struct TtsRuntime {
     provider: Option<Arc<dyn TtsProvider>>,
     voices: Vec<Voice>,
     selected: Option<String>,
     unavailable: Option<String>,
+    /// Pamięć klipów. Trzymamy ją tutaj, żeby zmiana głosu w ustawieniach działała od razu,
+    /// bez restartu aplikacji.
+    cache: ClipCache,
 }
 
 impl TtsRuntime {
@@ -341,7 +343,7 @@ impl TtsRuntime {
     /// głosu nie może wywracać aplikacji (PLAN.md, sekcja 8).
     pub fn prepare(voices: Vec<Voice>, preferred: &str, cache: ClipCache) -> Self {
         if voices.is_empty() {
-            return Self::unavailable("nie znaleziono żadnego głosu lektora".to_string());
+            return Self::unavailable("nie znaleziono żadnego głosu lektora".to_string(), cache);
         }
 
         let chosen = voices
@@ -359,21 +361,55 @@ impl TtsRuntime {
         }
 
         Self {
-            provider: Some(Arc::new(PiperTts::new(voice.clone(), cache))),
+            provider: Some(Arc::new(PiperTts::new(voice.clone(), cache.clone()))),
             voices,
             selected: Some(voice.id),
             unavailable: None,
+            cache,
         }
     }
 
     /// Lektor wyłączony. Aplikacja działa dalej — DJ przeczyta dedykację z ekranu.
-    pub fn unavailable(reason: String) -> Self {
+    pub fn unavailable(reason: String, cache: ClipCache) -> Self {
         Self {
             provider: None,
             voices: Vec::new(),
             selected: None,
             unavailable: Some(reason),
+            cache,
         }
+    }
+
+    /// Przełącza lektora na inny zainstalowany głos. `false` oznacza, że nie ma takiego głosu —
+    /// wtedy zostaje ten, którego słyszał DJ.
+    ///
+    /// Wołane przy zapisie ustawień: DJ wybiera głos przed imprezą i nie może się dowiedzieć,
+    /// że nowy wybór zadziała dopiero po restarcie.
+    pub fn select(&mut self, voice_id: &str) -> bool {
+        let Some(voice) = self
+            .voices
+            .iter()
+            .find(|voice| voice.id == voice_id)
+            .cloned()
+        else {
+            return false;
+        };
+
+        self.provider = Some(Arc::new(PiperTts::new(voice.clone(), self.cache.clone())));
+        self.selected = Some(voice.id);
+        self.unavailable = None;
+
+        true
+    }
+
+    /// Provider dla wskazanego, zainstalowanego głosu — podgląd pozwala porównać każdy z nich,
+    /// także ten, którym aplikacja akurat nie czyta dedykacji.
+    pub fn provider_for(&self, voice_id: &str) -> Option<PiperTts> {
+        self.voices
+            .iter()
+            .find(|voice| voice.id == voice_id)
+            .cloned()
+            .map(|voice| PiperTts::new(voice, self.cache.clone()))
     }
 
     /// Czy lektor jest gotowy do czytania dedykacji.
@@ -395,8 +431,8 @@ impl TtsRuntime {
 
     /// Provider lektora, jeśli jest gotowy. Generowanie klipów w tle bierze go stąd, żeby
     /// komenda nie musiała znac ani jednego typu silnika (PLAN.md, sekcja 8).
-    pub fn provider(&self) -> Option<&Arc<dyn TtsProvider>> {
-        self.provider.as_ref()
+    pub fn provider(&self) -> Option<Arc<dyn TtsProvider>> {
+        self.provider.as_ref().map(Arc::clone)
     }
 }
 
@@ -626,6 +662,55 @@ mod tests {
         assert_eq!(runtime.selected(), None);
         assert!(runtime.unavailable_reason().is_some());
     }
+
+    #[test]
+    fn switching_the_voice_changes_the_provider_without_a_restart() {
+        let root = temp_dir("select");
+
+        voice_dir(&root, "alpha", true, None);
+        voice_dir(&root, "beta", true, None);
+
+        let voices = discover_voices(&root).expect("wykrywanie głosów");
+        let cache = ClipCache::new(root.join("klipy"));
+        let mut runtime = TtsRuntime::prepare(voices, "alpha", cache);
+
+        assert!(runtime.select("beta"));
+        assert_eq!(runtime.selected(), Some("beta"));
+        assert_eq!(
+            runtime
+                .provider()
+                .map(|provider| provider.voice_id().to_string()),
+            Some("beta".to_string()),
+            "nowy głos musi czytać od razu, bez restartu aplikacji"
+        );
+
+        // Głosu, którego nie ma na dysku, nie da się wybrać — zostaje poprzedni.
+        assert!(!runtime.select("gamma"));
+        assert_eq!(runtime.selected(), Some("beta"));
+    }
+
+    #[test]
+    fn the_preview_provider_speaks_with_the_requested_voice() {
+        let root = temp_dir("preview-provider");
+
+        voice_dir(&root, "alpha", true, None);
+        voice_dir(&root, "beta", true, None);
+
+        let voices = discover_voices(&root).expect("wykrywanie głosów");
+        let cache = ClipCache::new(root.join("klipy"));
+        let runtime = TtsRuntime::prepare(voices, "alpha", cache);
+
+        // Podgląd pozwala posłuchać głosu, którego akurat nie używamy.
+        assert_eq!(
+            runtime
+                .provider_for("beta")
+                .map(|provider| provider.voice_id().to_string()),
+            Some("beta".to_string())
+        );
+        assert_eq!(runtime.selected(), Some("alpha"), "wybór się nie zmienia");
+
+        assert!(runtime.provider_for("gamma").is_none());
+    }
     /// Synteza prawdziwym modelem — jedyny test, który dotyka `sherpa-onnx`.
     ///
     /// Modele nie leżą w repozytorium, więc test jest domyślnie pomijany. Uruchomienie:
@@ -656,7 +741,7 @@ mod tests {
             "głos {preferred} nie został wybrany — czy na pewno jest w katalogu?"
         );
 
-        let provider = runtime.provider.clone().expect("provider lektora");
+        let provider = runtime.provider().expect("provider lektora");
 
         // Pierwsza dedykacja: silnik startuje i liczy klip. Kasujemy ewentualny klip z poprzedniego
         // przebiegu, żeby za każdym razem sprawdzić prawdziwą syntezę, a nie samą pamięć podręczną.

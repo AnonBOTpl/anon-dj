@@ -67,11 +67,45 @@ pub struct OutputDevice {
     pub is_default: bool,
 }
 
+/// Co odtwarzamy — voice-over prośby z kolejki albo próbkę głosu z ekranu lektora.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlaybackTarget {
+    /// Odsłuch dedykacji prośby.
+    Request(i64),
+    /// Odsłuch próbki głosu — DJ porównuje tak głosy i strojenie, zanim je zapisze.
+    Preview,
+}
+
 /// Stan odtwarzania wysyłany do interfejsu.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub struct PlaybackStatus {
-    /// Prośba, której voice-overu słuchamy; `None`, gdy nic nie leci.
+    /// Prośba, której voice-overu słuchamy; `None`, gdy nic nie leci albo leci próbka głosu.
     pub request_id: Option<i64>,
+    /// Czy leci próbka głosu z ekranu lektora.
+    pub preview: bool,
+}
+
+impl PlaybackStatus {
+    /// Nic nie leci.
+    fn stopped() -> Self {
+        Self {
+            request_id: None,
+            preview: false,
+        }
+    }
+
+    fn playing(target: PlaybackTarget) -> Self {
+        match target {
+            PlaybackTarget::Request(request_id) => Self {
+                request_id: Some(request_id),
+                preview: false,
+            },
+            PlaybackTarget::Preview => Self {
+                request_id: None,
+                preview: true,
+            },
+        }
+    }
 }
 
 /// Lista urządzeń wyjściowych, alfabetycznie po nazwie.
@@ -159,11 +193,11 @@ impl VoiceOverPlayer {
         }
     }
 
-    /// Odtwarza klip prośby na wskazanym urządzeniu. Poprzednie odtwarzanie milknie.
+    /// Odtwarza klip na wskazanym urządzeniu. Poprzednie odtwarzanie milknie.
     pub fn play(
         self: &Arc<Self>,
         app: &AppHandle,
-        request_id: i64,
+        target: PlaybackTarget,
         path: &Path,
         device_id: &str,
         volume: f32,
@@ -197,8 +231,12 @@ impl VoiceOverPlayer {
             Err(_) => return Err(AudioError::Unavailable),
         }
 
-        info!(request_id, "odtwarzam voice-over");
-        emit_playback(app, Some(request_id));
+        info!(
+            request_id = target.request_id(),
+            preview = matches!(target, PlaybackTarget::Preview),
+            "odtwarzam voice-over"
+        );
+        emit_playback(app, PlaybackStatus::playing(target));
         self.watch(app.clone(), serial, player);
 
         Ok(())
@@ -216,7 +254,7 @@ impl VoiceOverPlayer {
             active.player.stop();
 
             info!("voice-over zatrzymany");
-            emit_playback(app, None);
+            emit_playback(app, PlaybackStatus::stopped());
         }
     }
 
@@ -236,7 +274,7 @@ impl VoiceOverPlayer {
 
             // Ktoś mógł w międzyczasie puścić coś nowszego — wtedy nie wygaszamy interfejsu.
             if jobs.finish(serial) {
-                emit_playback(&app, None);
+                emit_playback(&app, PlaybackStatus::stopped());
             }
         });
     }
@@ -288,8 +326,18 @@ fn log_stream_error(error: cpal::StreamError) {
     warn!(error = %error, "błąd strumienia audio");
 }
 
-fn emit_playback(app: &AppHandle, request_id: Option<i64>) {
-    if let Err(error) = app.emit(EVENT_PLAYBACK, PlaybackStatus { request_id }) {
+impl PlaybackTarget {
+    /// Prośba, której dotyczy odtwarzanie; próbka głosu nie należy do żadnej prośby.
+    fn request_id(self) -> Option<i64> {
+        match self {
+            Self::Request(request_id) => Some(request_id),
+            Self::Preview => None,
+        }
+    }
+}
+
+fn emit_playback(app: &AppHandle, status: PlaybackStatus) {
+    if let Err(error) = app.emit(EVENT_PLAYBACK, status) {
         warn!(error = %error, "nie udało się wysłać stanu odtwarzania");
     }
 }
@@ -311,6 +359,32 @@ mod tests {
         assert_eq!(normalize_device_id(""), "");
         assert_eq!(normalize_device_id("   "), "");
         assert_eq!(normalize_device_id(" WASAPI:abc "), "WASAPI:abc");
+    }
+
+    #[test]
+    fn a_preview_is_reported_without_a_request_id() {
+        assert_eq!(
+            PlaybackStatus::playing(PlaybackTarget::Request(7)),
+            PlaybackStatus {
+                request_id: Some(7),
+                preview: false
+            }
+        );
+        assert_eq!(
+            PlaybackStatus::playing(PlaybackTarget::Preview),
+            PlaybackStatus {
+                request_id: None,
+                preview: true
+            },
+            "próbka głosu nie należy do żadnej prośby, a interfejs musi wiedzieć, że coś leci"
+        );
+        assert_eq!(
+            PlaybackStatus::stopped(),
+            PlaybackStatus {
+                request_id: None,
+                preview: false
+            }
+        );
     }
 
     #[test]

@@ -24,7 +24,8 @@ use tracing::{error, info, warn};
 
 use crate::db::{Db, DbError, LibraryFolder, QueuedRequest};
 use crate::library::{LibraryError, ScanSummary};
-use crate::settings::AppSettings;
+use crate::settings::{AppSettings, validate_tts};
+use crate::tts::{TtsProvider, VoiceTuning};
 
 /// Ile prośb pokazujemy w kolejce przeglądu.
 const QUEUE_LIMIT: u32 = 100;
@@ -43,6 +44,9 @@ const TTS_UNAVAILABLE: &str = "lektor jest niedostępny";
 /// Komunikat zwracany, gdy DJ próbuje odsłuchać prośbę, której klip jeszcze się liczy.
 const CLIP_NOT_READY: &str = "voice-over jeszcze się liczy";
 
+/// Komunikat zwracany, gdy DJ prosi o podgląd głosu, którego nie ma na dysku.
+const VOICE_UNKNOWN: &str = "nie ma takiego głosu lektora";
+
 /// Stan aplikacji współdzielony między komendami Tauri.
 struct AppState {
     db: Arc<Db>,
@@ -57,8 +61,9 @@ struct AppState {
     scanning: Arc<AtomicBool>,
     /// Serwer LAN dla kiosków.
     server: Arc<net::Server>,
-    /// Lektor dedykacji — albo gotowy, albo wyłączony z podanym powodem.
-    tts: piper::TtsRuntime,
+    /// Lektor dedykacji — albo gotowy, albo wyłączony z podanym powodem. Za blokadą, bo zapis
+    /// ustawień przełącza go na inny głos w locie.
+    tts: Mutex<piper::TtsRuntime>,
     /// Zlecenia generowania klipów lektora w tle wraz z postępem dla interfejsu.
     clips: Arc<clips::ClipJobs>,
     /// Odsłuch voice-overu na wybranym urządzeniu wyjściowym.
@@ -80,13 +85,15 @@ struct TtsStatus {
 
 /// Stan lektora: jakie głosy są zainstalowane i czy da się czytać dedykacje.
 #[tauri::command]
-fn tts_status(state: tauri::State<'_, AppState>) -> TtsStatus {
-    TtsStatus {
-        available: state.tts.is_available(),
-        selected: state.tts.selected().map(str::to_string),
-        reason: state.tts.unavailable_reason().map(str::to_string),
-        voices: state.tts.voices().to_vec(),
-    }
+fn tts_status(state: tauri::State<'_, AppState>) -> Result<TtsStatus, String> {
+    let tts = state.tts.lock().map_err(|_| TTS_UNAVAILABLE.to_string())?;
+
+    Ok(TtsStatus {
+        available: tts.is_available(),
+        selected: tts.selected().map(str::to_string),
+        reason: tts.unavailable_reason().map(str::to_string),
+        voices: tts.voices().to_vec(),
+    })
 }
 
 /// Stan klipów lektora. Interfejs pyta o niego po wczytaniu, żeby po przeładowaniu okna
@@ -117,10 +124,12 @@ async fn start_clip_generation(
     state: &AppState,
     request_id: i64,
 ) -> Result<(), String> {
-    let provider = match state.tts.provider() {
-        Some(provider) => Arc::clone(provider),
-        None => return Err(TTS_UNAVAILABLE.to_string()),
-    };
+    let provider = state
+        .tts
+        .lock()
+        .map_err(|_| TTS_UNAVAILABLE.to_string())?
+        .provider()
+        .ok_or_else(|| TTS_UNAVAILABLE.to_string())?;
 
     let tuning = {
         let settings = state
@@ -193,11 +202,97 @@ async fn play_dedication(
     let handle = app.clone();
 
     tauri::async_runtime::spawn_blocking(move || {
-        player.play(&handle, request_id, Path::new(&path), &device, volume)
+        player.play(
+            &handle,
+            audio::PlaybackTarget::Request(request_id),
+            Path::new(&path),
+            &device,
+            volume,
+        )
     })
     .await
     .map_err(|error| error.to_string())?
     .map_err(|error| error.to_string())
+}
+
+/// Wynik podglądu głosu lektora.
+#[derive(Debug, Clone, Copy, serde::Serialize)]
+struct VoicePreview {
+    /// Ile trwała synteza próbki — po tym DJ ocenia, czy klip zdąży przed emisją.
+    synthesis_ms: u64,
+    /// Długość nagrania w milisekundach.
+    duration_ms: u32,
+}
+
+/// Odsłuchuje próbkę głosu z podanym strojeniem i od razu ją puszcza.
+///
+/// To ekran porównywania głosów (PLAN.md, sekcja 8): DJ zmienia głos i suwaki, słucha, a wybór
+/// zapisuje dopiero wtedy, gdy mu się spodoba. Podgląd bierze więc głos i strojenie z formularza,
+/// a nie z zapisanych ustawień, i niczego nie utrwala.
+#[tauri::command(rename_all = "snake_case")]
+async fn preview_voice(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    voice: String,
+    tuning: VoiceTuning,
+    text: String,
+) -> Result<VoicePreview, String> {
+    let (device, max_chars) = {
+        let settings = state
+            .settings
+            .lock()
+            .map_err(|_| SETTINGS_UNAVAILABLE.to_string())?;
+
+        (
+            settings.audio.output_device_id.clone(),
+            settings.limits.dedication_max_chars as usize,
+        )
+    };
+
+    // Próbkę czytamy tym samym lektorem co dedykacje, więc obowiązuje ją ten sam limit i ta sama
+    // walidacja głosu oraz strojenia.
+    let text =
+        protocol::validate_dedication_with(&text, max_chars).map_err(|error| error.to_string())?;
+    validate_tts(&voice, &tuning).map_err(|error| error.to_string())?;
+
+    let provider = state
+        .tts
+        .lock()
+        .map_err(|_| TTS_UNAVAILABLE.to_string())?
+        .provider_for(&voice)
+        .ok_or_else(|| format!("{VOICE_UNKNOWN}: {voice}"))?;
+
+    let volume = audio::playback_volume(tuning.volume_percent);
+    let player = Arc::clone(&state.audio);
+    let handle = app.clone();
+
+    // Synteza i otwarcie strumienia to praca dla wątku roboczego — nawet podgląd nie może
+    // zamrozić okna.
+    tauri::async_runtime::spawn_blocking(move || {
+        let started = std::time::Instant::now();
+
+        let clip = provider
+            .synthesize(&text, &tuning)
+            .map_err(|error| error.to_string())?;
+        let synthesis_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+
+        player
+            .play(
+                &handle,
+                audio::PlaybackTarget::Preview,
+                &clip.path,
+                &device,
+                volume,
+            )
+            .map_err(|error| error.to_string())?;
+
+        Ok(VoicePreview {
+            synthesis_ms,
+            duration_ms: clip.duration_ms,
+        })
+    })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 /// Zatrzymuje odsłuch voice-overu.
@@ -529,6 +624,18 @@ async fn save_settings(
         info!(port = settings.port, "zmiana portu serwera kiosków");
 
         state.server.set_port(settings.port);
+    }
+
+    // Głos lektora działa od razu. DJ wybiera go przed imprezą i nie może się dowiedzieć, że nowy
+    // wybór wejdzie w życie dopiero po restarcie aplikacji.
+    let switched = state
+        .tts
+        .lock()
+        .map_err(|_| TTS_UNAVAILABLE.to_string())?
+        .select(&settings.tts.voice);
+
+    if switched {
+        info!(voice = %settings.tts.voice, "lektor przełączony na wybrany głos");
     }
 
     info!(
@@ -869,20 +976,20 @@ pub fn run() {
             // Lektor przygotowujemy z gotowych plików; brak głosów nie może zatrzymać startu —
             // wtedy aplikacja działa bez voice-overu, a DJ czyta dedykację z ekranu.
             let voices_dir = piper::default_voices_dir(&app_data_dir);
+            let cache = crate::tts::ClipCache::new(app_data_dir.join("tts-cache"));
             let tts = match piper::discover_voices(&voices_dir) {
                 Ok(voices) => {
                     let preferred = settings
                         .lock()
                         .map(|settings| settings.tts.voice.clone())
                         .unwrap_or_default();
-                    let cache = crate::tts::ClipCache::new(app_data_dir.join("tts-cache"));
 
                     piper::TtsRuntime::prepare(voices, &preferred, cache)
                 }
                 Err(error) => {
                     warn!(error = %error, "nie udało się wypisać głosów lektora, wyłączam lektora");
 
-                    piper::TtsRuntime::unavailable(error.to_string())
+                    piper::TtsRuntime::unavailable(error.to_string(), cache)
                 }
             };
 
@@ -907,7 +1014,7 @@ pub fn run() {
                 settings,
                 scanning: Arc::new(AtomicBool::new(false)),
                 server,
-                tts,
+                tts: Mutex::new(tts),
                 clips,
                 audio,
             });
@@ -940,7 +1047,8 @@ pub fn run() {
             generate_clip,
             audio_devices,
             play_dedication,
-            stop_dedication
+            stop_dedication,
+            preview_voice
         ])
         .run(tauri::generate_context!())
         .expect("nie udało się uruchomić aplikacji ANON DJ");

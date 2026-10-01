@@ -96,6 +96,44 @@ export type OutputDevice = {
 
 /** Stan odtwarzania voice-overu — zgadza się z `PlaybackStatus` w `src-tauri/src/audio.rs`. */
 export type PlaybackStatus = {
-  /** Prośba, której voice-overu słuchamy; `null`, gdy nic nie leci. */
+  /** Prośba, której voice-overu słuchamy; `null`, gdy nic nie leci albo leci próbka głosu. */
   request_id: number | null;
+  /** Czy leci próbka głosu z ekranu lektora. */
+  preview: boolean;
+};
+
+/** Jakość modelu głosu — zgadza się z `VoiceQuality` w `src-tauri/src/piper.rs`. */
+export type VoiceQuality = "low" | "medium" | "high" | "unknown";
+
+/** Zainstalowany głos lektora — zgadza się z `Voice` w `src-tauri/src/piper.rs`. */
+export type Voice = {
+  /** Identyfikator = nazwa katalogu; to zapisujemy w ustawieniach. */
+  id: string;
+  /** Nazwa do pokazania DJ-owi. */
+  name: string;
+  quality: VoiceQuality;
+  /** Rozmiar modelu w bajtach. */
+  size_bytes: number;
+  /** Licencja, jeśli głos ją deklaruje. */
+  license: string | null;
+};
+
+/** Stan lektora — zgadza się z `TtsStatus` w `src-tauri/src/lib.rs`. */
+export type TtsStatus = {
+  /** Czy da się przeczytać dedykację. */
+  available: boolean;
+  /** Głos, którym aplikacja czyta teraz; `null`, gdy lektora nie ma. */
+  selected: string | null;
+  /** Dlaczego lektora nie ma — DJ ma wiedzieć, co poprawić. */
+  reason: string | null;
+  /** Głosy znalezione na dysku. */
+  voices: Voice[];
+};
+
+/** Wynik podglądu głosu — zgadza się z `VoicePreview` w `src-tauri/src/lib.rs`. */
+export type VoicePreview = {
+  /** Ile trwała synteza próbki. */
+  synthesis_ms: number;
+  /** Długość nagrania. */
+  duration_ms: number;
 };
