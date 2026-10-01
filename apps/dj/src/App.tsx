@@ -16,7 +16,7 @@ import {
 
 import { LibraryView } from "./components/LibraryView";
 import { QueuesView } from "./components/QueuesView";
-import { SettingsView } from "./components/SettingsView";
+import { SettingsDialog } from "./components/SettingsDialog";
 import { TitleBar } from "./components/TitleBar";
 import { VoiceView } from "./components/VoiceView";
 import { ui } from "./text";
@@ -41,7 +41,9 @@ type ServerStatus = {
 /** Zdarzenie o zmianie stanu serwera kiosków. */
 const EVENT_KIOSK_STATUS = "kiosk://status";
 
-type View = "queues" | "library" | "voice" | "settings";
+// Ustawień nie ma na tej liście: otwierają się jako okno nad bieżącym widokiem, więc nie trzeba
+// przerywać tego, co DJ akurat robi w kolejkach.
+type View = "queues" | "library" | "voice";
 
 type ChipTone = "neutral" | "warning" | "danger";
 
@@ -109,6 +111,7 @@ export default function App() {
   const [server, setServer] = useState<ServerStatus | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [view, setView] = useState<View>("queues");
+  const [settingsOpen, setSettingsOpen] = useState(false);
 
   // Serwer kiosków melduje się zdarzeniem; na starcie pytamy o stan raz, żeby pasek statusu
   // nie czekał na pierwsze połączenie.
@@ -221,10 +224,10 @@ export default function App() {
             onClick={() => setView("voice")}
           />
           <NavButton
-            active={view === "settings"}
+            active={settingsOpen}
             icon={<Settings className="h-4 w-4" />}
             label={ui.nav.settings}
-            onClick={() => setView("settings")}
+            onClick={() => setSettingsOpen(true)}
           />
         </nav>
       </section>
@@ -235,8 +238,6 @@ export default function App() {
         {view === "library" && <LibraryView />}
 
         {view === "voice" && <VoiceView />}
-
-        {view === "settings" && <SettingsView />}
       </main>
 
       <footer className="flex shrink-0 items-center gap-4 border-t border-scena-800 bg-scena-900/60 px-3 py-1.5 text-[11px] text-zinc-500">
@@ -259,6 +260,8 @@ export default function App() {
           <span>{ui.status.loading}</span>
         )}
       </footer>
+
+      {settingsOpen && <SettingsDialog onClose={() => setSettingsOpen(false)} />}
     </div>
   );
 }

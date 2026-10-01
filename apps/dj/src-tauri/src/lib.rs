@@ -83,6 +83,15 @@ struct TtsStatus {
     voices: Vec<piper::Voice>,
 }
 
+/// Domyślne ustawienia lektora — dla przycisku „Przywróć domyślne” na ekranie lektora.
+///
+/// Wartości bierzemy z warstwy Rust, a nie z interfejsu, żeby domyślne istniały dokładnie
+/// w jednym miejscu: tam, gdzie stoi walidacja i od czego startuje świeża instalacja.
+#[tauri::command]
+fn tts_defaults() -> crate::settings::TtsSettings {
+    crate::settings::TtsSettings::default()
+}
+
 /// Stan lektora: jakie głosy są zainstalowane i czy da się czytać dedykacje.
 #[tauri::command]
 fn tts_status(state: tauri::State<'_, AppState>) -> Result<TtsStatus, String> {
@@ -1043,6 +1052,7 @@ pub fn run() {
             update_dedication,
             move_request,
             tts_status,
+            tts_defaults,
             clip_states,
             generate_clip,
             audio_devices,
