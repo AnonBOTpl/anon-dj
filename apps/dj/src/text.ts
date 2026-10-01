@@ -11,6 +11,10 @@ export const ui = {
   status: {
     player: "Odtwarzacz",
     playerUnknown: "nie sprawdzono",
+    playerUnavailable: "brak połączenia",
+    playerPlaying: "gra",
+    playerPaused: "pauza",
+    playerStopped: "nie gra",
     kiosk: "Kiosk",
     kioskDisconnected: "rozłączony",
     server: "Serwer",

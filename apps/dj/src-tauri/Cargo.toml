@@ -55,3 +55,7 @@ sherpa-onnx = "1.13.8"
 # słyszalnym punkcie aplikacji. Wyłączamy domyślne dekodery (mp3/mp4/vorbis/flac), bo gramy
 # wyłącznie własne WAV-y, a `tracing` kieruje błędy strumienia do naszego logu.
 rodio = { version = "0.22.2", default-features = false, features = ["playback", "wav", "tracing"] }
+# Klient HTTP do lokalnego API odtwarzacza (beefweb). `ureq` jest synchroniczny i lekki
+# (bez async runtime i bez TLS), a wywołania i tak idą przez `spawn_blocking`, żeby nie
+# blokować wątku UI (AGENTS.md). TLS jest wyłączony świadomie: beefweb stoi na localhost.
+ureq = { version = "3.4.2", default-features = false, features = ["json"] }

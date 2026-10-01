@@ -40,6 +40,8 @@ pub const KEY_TTS_SENTENCE_SILENCE: &str = "tts.sentence_silence_ms";
 /// Klucz ustawienia z urządzeniem wyjściowym voice-overu. Trzymamy **identyfikator**
 /// urządzenia, bo przeżywa restart systemu i ponowne podłączenie karty.
 pub const KEY_AUDIO_OUTPUT_DEVICE: &str = "audio.output_device_id";
+/// Klucz ustawienia z adresem API odtwarzacza (beefweb w foobar2000).
+pub const KEY_PLAYER_BASE_URL: &str = "player.base_url";
 
 /// PIN, od którego startuje świeża instalacja. DJ może i powinien go zmienić w ustawieniach.
 pub const DEFAULT_PIN: &str = "123456";
@@ -65,6 +67,14 @@ pub const CONFIRMATION_SECONDS_RANGE: (u32, u32) = (5, 300);
 pub const DEFAULT_TTS_VOICE: &str = "justyna";
 /// Najdłuższa dopuszczalna nazwa głosu.
 pub const TTS_VOICE_MAX_CHARS: usize = 64;
+
+/// Adres API odtwarzacza, od którego startuje świeża instalacja. To domyślny port beefweb
+/// (PLAN.md, sekcja 7) — świeża instalacja działa bez zaglądania do ustawień, o ile foobar2000
+/// z beefwebem stoi właśnie tam.
+pub const DEFAULT_PLAYER_BASE_URL: &str = "http://localhost:8880";
+/// Najdłuższy dopuszczalny adres API odtwarzacza. Adres wpisuje DJ, więc ograniczamy go,
+/// żeby literówka nie trafiła do klienta HTTP jako kilometrowy ciąg.
+pub const PLAYER_BASE_URL_MAX_CHARS: usize = 200;
 
 /// Najdłuższa dopuszczalna nazwa urządzenia wyjściowego. Nazwy kart dźwiękowych bywają długie
 /// (producent, model, tryb), ale nie aż tak — a wpis bez ograniczenia to zaproszenie do błędu.
@@ -112,6 +122,9 @@ pub enum SettingsError {
 
     #[error("nazwa urządzenia wyjściowego jest za długa (limit {AUDIO_DEVICE_MAX_CHARS} znaków)")]
     InvalidAudioDevice,
+
+    #[error("adres odtwarzacza musi zaczynać się od `http://` i nie zawierać spacji: „{0}”")]
+    InvalidPlayerUrl(String),
 }
 
 impl SettingsError {
@@ -150,6 +163,21 @@ pub struct AudioSettings {
     pub output_device_id: String,
 }
 
+/// Ustawienia odtwarzacza: gdzie stoi API beefweb.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PlayerSettings {
+    /// Bazowy adres API, np. `http://localhost:8880`. Bez ukośnika na końcu.
+    pub base_url: String,
+}
+
+impl Default for PlayerSettings {
+    fn default() -> Self {
+        Self {
+            base_url: DEFAULT_PLAYER_BASE_URL.to_string(),
+        }
+    }
+}
+
 /// Efektywne ustawienia aplikacji DJ-a.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct AppSettings {
@@ -167,6 +195,10 @@ pub struct AppSettings {
     /// ustawienia, i to z domyślnym urządzeniem systemowym.
     #[serde(default)]
     pub audio: AudioSettings,
+    /// Odtwarzacz (foobar2000 + beefweb). `default` — starszy interfejs bez tego pola nadal
+    /// zapisze ustawienia, i to z domyślnym adresem.
+    #[serde(default)]
+    pub player: PlayerSettings,
 }
 
 impl Default for AppSettings {
@@ -178,6 +210,7 @@ impl Default for AppSettings {
             limits: Limits::default(),
             tts: TtsSettings::default(),
             audio: AudioSettings::default(),
+            player: PlayerSettings::default(),
         }
     }
 }
@@ -223,6 +256,11 @@ impl AppSettings {
                 output_device_id: db
                     .setting(KEY_AUDIO_OUTPUT_DEVICE)?
                     .unwrap_or(defaults.audio.output_device_id),
+            },
+            player: PlayerSettings {
+                base_url: db
+                    .setting(KEY_PLAYER_BASE_URL)?
+                    .unwrap_or(defaults.player.base_url),
             },
         };
 
@@ -271,6 +309,7 @@ impl AppSettings {
         )?;
 
         db.set_setting(KEY_AUDIO_OUTPUT_DEVICE, &self.audio.output_device_id)?;
+        db.set_setting(KEY_PLAYER_BASE_URL, self.player.base_url.trim())?;
 
         Ok(())
     }
@@ -307,6 +346,8 @@ impl AppSettings {
         validate_tts(&self.tts.voice, &self.tts.tuning)?;
 
         check_audio_device(&self.audio.output_device_id)?;
+
+        check_player_url(&self.player.base_url)?;
 
         Ok(())
     }
@@ -345,6 +386,28 @@ pub fn validate_tts(voice: &str, tuning: &VoiceTuning) -> Result<(), SettingsErr
 fn check_audio_device(device_id: &str) -> Result<(), SettingsError> {
     if device_id.chars().count() > AUDIO_DEVICE_MAX_CHARS {
         return Err(SettingsError::InvalidAudioDevice);
+    }
+
+    Ok(())
+}
+
+/// Adres API odtwarzacza trafia prosto do klienta HTTP. Wymagamy `http://`, bo beefweb stoi
+/// lokalnie i nie ma tam czego szyfrować — a klient HTTP jest zbudowany bez obsługi TLS,
+/// więc `https://` i tak by nie zadziałał. Adres z literówką lepiej odrzucić przy zapisie, niż
+/// pokazać DJ-owi „brak połączenia z odtwarzaczem” w środku imprezy.
+fn check_player_url(base_url: &str) -> Result<(), SettingsError> {
+    let trimmed = base_url.trim();
+
+    let looks_like_url = !trimmed.is_empty()
+        && trimmed.chars().count() <= PLAYER_BASE_URL_MAX_CHARS
+        && !trimmed
+            .chars()
+            .any(|character| character.is_whitespace() || character.is_control())
+        && trimmed.starts_with("http://")
+        && trimmed.len() > "http://".len();
+
+    if !looks_like_url {
+        return Err(SettingsError::InvalidPlayerUrl(trimmed.to_string()));
     }
 
     Ok(())
@@ -475,11 +538,48 @@ mod tests {
             audio: AudioSettings {
                 output_device_id: "wasapi:Głośniki (Realtek Audio)".to_string(),
             },
+            player: PlayerSettings {
+                base_url: "http://localhost:8880".to_string(),
+            },
         };
 
         settings.save(&db).expect("zapis ustawień");
 
         assert_eq!(AppSettings::load(&db).expect("odczyt ustawień"), settings);
+    }
+
+    #[test]
+    fn the_player_address_must_be_a_local_http_url() {
+        let mut settings = AppSettings::default();
+        assert!(settings.validate().is_ok());
+
+        settings.player.base_url = "localhost:8880".to_string();
+        assert!(settings.validate().is_err(), "bez schematu to nie adres");
+
+        settings.player.base_url = "https://localhost:8880".to_string();
+        assert!(settings.validate().is_err(), "klient nie obsługuje TLS");
+
+        settings.player.base_url = "http://local host:8880".to_string();
+        assert!(settings.validate().is_err(), "spacja w adresie");
+
+        settings.player.base_url = format!("http://{}", "a".repeat(300));
+        assert!(settings.validate().is_err(), "adres ponad limit");
+
+        settings.player.base_url = "http://127.0.0.1:8880/".to_string();
+        assert!(settings.validate().is_ok());
+    }
+
+    #[test]
+    fn the_player_url_is_saved_without_surrounding_spaces() {
+        let db = Db::open_in_memory().expect("baza w pamięci");
+
+        let mut settings = AppSettings::default();
+        settings.player.base_url = "  http://127.0.0.1:8880  ".to_string();
+        settings.save(&db).expect("zapis ustawień");
+
+        let loaded = AppSettings::load(&db).expect("odczyt ustawień");
+
+        assert_eq!(loaded.player.base_url, "http://127.0.0.1:8880");
     }
 
     #[test]
@@ -507,6 +607,7 @@ mod tests {
         .expect("starszy interfejs bez pola audio");
 
         assert_eq!(settings.audio, AudioSettings::default());
+        assert_eq!(settings.player, PlayerSettings::default());
     }
 
     #[test]

@@ -38,8 +38,27 @@ type ServerStatus = {
   kiosks: string[];
 };
 
+/** Stan odtwarzacza — zgadza się z `PlayerStatusView` w warstwie Rust (spłaszczony `PlayerStatus`). */
+type PlayerStatus = {
+  available: boolean;
+  state: "playing" | "paused" | "stopped";
+  title: string | null;
+  artist: string | null;
+  path: string | null;
+  position_seconds: number;
+  duration_seconds: number;
+  /** Powód braku połączenia — `null`, gdy odtwarzacz odpowiada. */
+  problem: string | null;
+};
+
 /** Zdarzenie o zmianie stanu serwera kiosków. */
 const EVENT_KIOSK_STATUS = "kiosk://status";
+
+/**
+ * Co ile odpyujemy stan odtwarzacza. Stan i tak zmienia DJ w foobarze, więc pytamy często,
+ * ale nie na tyle, żeby zawracać głowę lokalnemu API.
+ */
+const PLAYER_POLL_MS = 2_000;
 
 // Ustawień nie ma na tej liście: otwierają się jako okno nad bieżącym widokiem, więc nie trzeba
 // przerywać tego, co DJ akurat robi w kolejkach.
@@ -58,11 +77,14 @@ function Chip({
   label,
   value,
   tone,
+  hint,
 }: {
   icon: ReactNode;
   label: string;
   value: string;
   tone: ChipTone;
+  /** Dłuższe wyjaśnienie pokazywane po najechaniu (np. powód braku połączenia). */
+  hint?: string;
 }) {
   return (
     <motion.span
@@ -70,6 +92,7 @@ function Chip({
       initial={{ opacity: 0 }}
       animate={{ opacity: 1 }}
       transition={{ duration: 0.15 }}
+      title={hint}
       className={`flex min-w-0 items-center gap-2 rounded-full border bg-scena-900 px-3 py-1 text-xs ${chipTones[tone]}`}
     >
       {icon}
@@ -109,6 +132,7 @@ function NavButton({
 export default function App() {
   const [status, setStatus] = useState<AppStatus | null>(null);
   const [server, setServer] = useState<ServerStatus | null>(null);
+  const [player, setPlayer] = useState<PlayerStatus | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [view, setView] = useState<View>("queues");
   const [settingsOpen, setSettingsOpen] = useState(false);
@@ -160,6 +184,32 @@ export default function App() {
     };
   }, []);
 
+  // Stan odtwarzacza odpytujemy w pętli — foobarem DJ steruje też ręcznie, więc nie ma tu
+  // zdarzenia, na które można by czekać.
+  useEffect(() => {
+    let active = true;
+
+    const poll = () => {
+      invoke<PlayerStatus>("player_status")
+        .then((value) => {
+          if (active) {
+            setPlayer(value);
+          }
+        })
+        .catch(() => {
+          // Brak stanu odtwarzacza to nie błąd aplikacji — chip pokaże „nie sprawdzono”.
+        });
+    };
+
+    poll();
+    const timer = window.setInterval(poll, PLAYER_POLL_MS);
+
+    return () => {
+      active = false;
+      window.clearInterval(timer);
+    };
+  }, []);
+
   const kioskConnected = (server?.connected ?? 0) > 0;
   const kioskValue = kioskConnected
     ? (server?.kiosks ?? []).join(", ")
@@ -172,16 +222,35 @@ export default function App() {
         ? `${server.address ?? ui.status.serverUnknownAddress}:${server.port}`
         : ui.status.serverUnavailable;
 
+  const playerAvailable = player?.available ?? false;
+  const playerValue =
+    player === null
+      ? ui.status.playerUnknown
+      : !player.available
+        ? ui.status.playerUnavailable
+        : player.state === "playing"
+          ? (player.title ?? player.artist ?? ui.status.playerPlaying)
+          : player.state === "paused"
+            ? ui.status.playerPaused
+            : ui.status.playerStopped;
+
   return (
     <div className="app-chrome flex h-full flex-col bg-scena-950">
       <TitleBar />
 
       <section className="flex shrink-0 items-center gap-2 border-b border-scena-800 bg-scena-900/60 px-3 py-2">
         <Chip
-          icon={<Disc3 className="h-3.5 w-3.5" />}
+          icon={
+            playerAvailable ? (
+              <Disc3 className="h-3.5 w-3.5" />
+            ) : (
+              <WifiOff className="h-3.5 w-3.5" />
+            )
+          }
           label={ui.status.player}
-          value={ui.status.playerUnknown}
-          tone="neutral"
+          value={playerValue}
+          tone={player === null || playerAvailable ? "neutral" : "warning"}
+          hint={player?.problem ?? undefined}
         />
         <Chip
           icon={kioskConnected ? <Wifi className="h-3.5 w-3.5" /> : <WifiOff className="h-3.5 w-3.5" />}

@@ -8,6 +8,8 @@ mod logging;
 mod net;
 // Silnik lektora: głosy Piper uruchamiane przez `sherpa-onnx`.
 mod piper;
+// Adapter odtwarzacza (foobar2000 + beefweb). Cała wiedza o beefweb siedzi w tym module.
+mod player;
 mod settings;
 // Publiczny, bo kontrakt lektora (`TtsProvider`) jest zamierzony jako punkt wejścia dla silników
 // TTS — dopóki nic go nie woła z wewnątrz, prywatny moduł zgłaszałby martwy kod.
@@ -24,6 +26,7 @@ use tracing::{error, info, warn};
 
 use crate::db::{Db, DbError, LibraryFolder, QueuedRequest};
 use crate::library::{LibraryError, ScanSummary};
+use crate::player::{PlayerAdapter, PlayerStatus};
 use crate::settings::{AppSettings, validate_tts};
 use crate::tts::{TtsProvider, VoiceTuning};
 
@@ -562,6 +565,73 @@ struct AppStatus {
     log_dir: String,
 }
 
+/// Stan odtwarzacza pokazywany w pasku statusu. Brak połączenia nie jest błędem aplikacji —
+/// niosiemy go razem z powodem, żeby DJ wiedział, co poprawić (degraded mode, PLAN.md sekcja 7).
+#[derive(Debug, Clone, serde::Serialize)]
+struct PlayerStatusView {
+    #[serde(flatten)]
+    status: PlayerStatus,
+    /// Powód braku połączenia — `null`, gdy odtwarzacz odpowiada.
+    problem: Option<String>,
+}
+
+/// Buduje adapter odtwarzacza z **bieżących** ustawień. Tanie — dzięki temu zmiana adresu
+/// w ustawieniach działa od razu, bez restartu i bez trzymania drugiego kopii konfiguracji.
+fn player_adapter(state: &AppState) -> Result<crate::player::BeefwebAdapter, String> {
+    let base_url = state
+        .settings
+        .lock()
+        .map_err(|_| SETTINGS_UNAVAILABLE.to_string())?
+        .player
+        .base_url
+        .clone();
+
+    crate::player::BeefwebAdapter::new(&base_url).map_err(|error| error.to_string())
+}
+
+/// Bieżący stan odtwarzacza (polling z interfejsu).
+#[tauri::command]
+async fn player_status(state: tauri::State<'_, AppState>) -> Result<PlayerStatusView, String> {
+    let adapter = player_adapter(state.inner())?;
+
+    let status = run_player(move || adapter.status()).await;
+
+    Ok(match status {
+        Ok(status) => PlayerStatusView {
+            status,
+            problem: None,
+        },
+        Err(error) => {
+            warn!(error = %error, "odtwarzacz nie odpowiada");
+
+            PlayerStatusView {
+                status: PlayerStatus::offline(),
+                problem: Some(error.to_string()),
+            }
+        }
+    })
+}
+
+/// Uruchamia utwór w odtwarzaczu od razu (na razie używane przez sekwencję wykonania).
+#[tauri::command(rename_all = "snake_case")]
+async fn player_play_now(state: tauri::State<'_, AppState>, path: String) -> Result<(), String> {
+    let adapter = player_adapter(state.inner())?;
+
+    run_player(move || adapter.play_now(&path))
+        .await
+        .map_err(|error| error.to_string())
+}
+
+/// Ustawia utwór jako następny w odtwarzaczu.
+#[tauri::command(rename_all = "snake_case")]
+async fn player_play_next(state: tauri::State<'_, AppState>, path: String) -> Result<(), String> {
+    let adapter = player_adapter(state.inner())?;
+
+    run_player(move || adapter.play_next(&path))
+        .await
+        .map_err(|error| error.to_string())
+}
+
 #[tauri::command]
 async fn app_status(state: tauri::State<'_, AppState>) -> Result<AppStatus, String> {
     Ok(AppStatus {
@@ -910,6 +980,24 @@ fn emit_scan_progress(app: &tauri::AppHandle, progress: &ScanProgress) {
 
 /// Uruchamia operację na bazie na wątku roboczym — dostęp do dysku nigdy nie idzie przez
 /// wątek interfejsu (AGENTS.md, zasady architektury).
+/// Wykonuje blokujące wywołanie odtwarzacza poza wątkiem UI (AGENTS.md).
+///
+/// Żądanie do beefweb może wisieć do timeoutu, więc nie ma prawa zatrzymać interfejsu DJ-a.
+async fn run_player<T, F>(operation: F) -> Result<T, player::PlayerError>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T, player::PlayerError> + Send + 'static,
+{
+    match tauri::async_runtime::spawn_blocking(operation).await {
+        Ok(result) => result,
+        Err(join_error) => {
+            error!(error = %join_error, "wątek odtwarzacza zakończył się błędem");
+
+            Err(player::PlayerError::Unavailable(join_error.to_string()))
+        }
+    }
+}
+
 async fn run_db<T, E, F>(operation: F) -> Result<T, String>
 where
     T: Send + 'static,
@@ -1058,7 +1146,10 @@ pub fn run() {
             audio_devices,
             play_dedication,
             stop_dedication,
-            preview_voice
+            preview_voice,
+            player_status,
+            player_play_now,
+            player_play_next
         ])
         .run(tauri::generate_context!())
         .expect("nie udało się uruchomić aplikacji ANON DJ");
