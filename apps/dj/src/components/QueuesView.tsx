@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useState, type MouseEvent, type ReactNode } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { ArrowDown, ArrowUp, Ban, Check } from "lucide-react";
+import { ArrowDown, ArrowUp, Ban, Check, LoaderCircle, Play } from "lucide-react";
 
 import { Panel } from "./Panel";
 import { RequestCard } from "./RequestCard";
@@ -76,6 +76,9 @@ export function QueuesView() {
   // Który voice-over leci teraz. Trzymamy to po zdarzeniach z warstwy Rust, żeby przyciski
   // we wszystkich kolejkach zgadzały się z tym, co naprawdę słychać.
   const [playingRequestId, setPlayingRequestId] = useState<number | null>(null);
+  // Która prośba jest właśnie wykonywana. Sekwencja trwa kilka sekund (ściszenie, dedykacja,
+  // wyciszenie starego utworu), więc DJ musi widzieć, że coś się dzieje.
+  const [executingId, setExecutingId] = useState<number | null>(null);
 
   const refresh = useCallback(async () => {
     const [review, ready, history] = await Promise.all([
@@ -246,6 +249,25 @@ export function QueuesView() {
     }
   }
 
+  /**
+   * Wykonanie prośby: sekwencja po stronie Rusta ścisza muzykę, czyta dedykację i wpuszcza
+   * zamówiony utwór. Nie idziemy tu przez `run`, bo tamto ustawia `busy` i blokuje cały ekran —
+   * a DJ ma w tym czasie widzieć, które wykonanie trwa.
+   */
+  async function handleExecute(requestId: number) {
+    setError(null);
+    setExecutingId(requestId);
+
+    try {
+      await invoke("execute_request", { request_id: requestId });
+      await refresh();
+    } catch (reason: unknown) {
+      setError(`${ui.queue.executeError} ${String(reason)}`);
+    } finally {
+      setExecutingId(null);
+    }
+  }
+
   const reviewEmpty = queues.review.length === 0;
   const readyEmpty = queues.ready.length === 0;
   const historyEmpty = queues.history.length === 0;
@@ -342,6 +364,27 @@ export function QueuesView() {
                     }
                     actions={
                       <>
+                        <ActionButton
+                          icon={
+                            executingId === request.id ? (
+                              <LoaderCircle className="h-3.5 w-3.5 animate-spin" />
+                            ) : (
+                              <Play className="h-3.5 w-3.5" />
+                            )
+                          }
+                          label={executingId === request.id ? ui.queue.executing : ui.queue.execute}
+                          // Bez gotowego voice-overu nie ma czego czytać, a bez odtwarzacza nie ma
+                          // gdzie zagrać — w obu przypadkach przycisk musi być nieaktywny.
+                          disabled={
+                            busy ||
+                            executingId !== null ||
+                            voiceOverFor(request).status !== "ready"
+                          }
+                          onClick={(event) => {
+                            event.stopPropagation();
+                            void handleExecute(request.id);
+                          }}
+                        />
                         <ActionButton
                           icon={<ArrowUp className="h-3.5 w-3.5" />}
                           label={ui.queue.moveUp}

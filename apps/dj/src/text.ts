@@ -35,7 +35,7 @@ export const ui = {
     readyHint: "Zatwierdzone dedykacje. Ustaw kolejność, w jakiej pójdą na antenę.",
     readyEmpty: "Nic nie czeka na wykonanie.",
     historyTitle: "Historia",
-    historyHint: "Wykonane i odrzucone dedykacje.",
+    historyHint: "Dedykacje już na antenie, wykonane i odrzucone.",
     historyEmpty: "Historia jest pusta.",
     approve: "Zatwierdź",
     reject: "Odrzuć",
@@ -49,6 +49,9 @@ export const ui = {
     rejectError: "Nie udało się odrzucić dedykacji:",
     editError: "Nie udało się zapisać poprawki:",
     moveError: "Nie udało się przesunąć dedykacji:",
+    execute: "Wykonaj",
+    executing: "Wykonuję…",
+    executeError: "Nie udało się wykonać dedykacji:",
     // Voice-over: stan przygotowania klipu lektora (PLAN.md, sekcja 8).
     voiceOver: {
       generating: "Generuję voice-over…",

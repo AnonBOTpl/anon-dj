@@ -42,6 +42,21 @@ pub const KEY_TTS_SENTENCE_SILENCE: &str = "tts.sentence_silence_ms";
 pub const KEY_AUDIO_OUTPUT_DEVICE: &str = "audio.output_device_id";
 /// Klucz ustawienia z adresem API odtwarzacza (beefweb w foobar2000).
 pub const KEY_PLAYER_BASE_URL: &str = "player.base_url";
+/// Klucz ustawienia z poziomem ściszenia muzyki pod lektorem (procent amplitudy).
+pub const KEY_EXECUTE_DUCK_PERCENT: &str = "execute.duck_percent";
+/// Klucz ustawienia z czasem ściszania do poziomu ducku.
+pub const KEY_EXECUTE_DUCK_RAMP_MS: &str = "execute.duck_ramp_ms";
+/// Klucz ustawienia z pauzą między końcem dedykacji a wyciszeniem starego utworu.
+pub const KEY_EXECUTE_GAP_MS: &str = "execute.gap_ms";
+/// Klucz ustawienia z czasem wyciszania starego utworu.
+pub const KEY_EXECUTE_FADE_OUT_MS: &str = "execute.fade_out_ms";
+/// Klucz ustawienia z czasem wchodzenia zamówionego utworu do normalnej głośności.
+pub const KEY_EXECUTE_START_RAMP_MS: &str = "execute.start_ramp_ms";
+/// Klucz z głośnością normalną odtwarzacza na czas sekwencji wykonania.
+///
+/// To nie jest ustawienie DJ-a, a **znacznik stanu**: niepusty wpis znaczy „sekwencja właśnie
+/// leci”, więc po nagłym zamknięciu aplikacji wiemy, do jakiego poziomu wrócić.
+pub const KEY_EXECUTE_NORMAL_VOLUME_DB: &str = "execute.normal_volume_db";
 
 /// PIN, od którego startuje świeża instalacja. DJ może i powinien go zmienić w ustawieniach.
 pub const DEFAULT_PIN: &str = "123456";
@@ -79,6 +94,24 @@ pub const PLAYER_BASE_URL_MAX_CHARS: usize = 200;
 /// Najdłuższa dopuszczalna nazwa urządzenia wyjściowego. Nazwy kart dźwiękowych bywają długie
 /// (producent, model, tryb), ale nie aż tak — a wpis bez ograniczenia to zaproszenie do błędu.
 pub const AUDIO_DEVICE_MAX_CHARS: usize = 128;
+
+/// Na jaką część głośności ściszamy muzykę pod lektorem, w procentach amplitudy.
+/// Zapas na jedną trzecią — utwór ma być słyszalny pod głosem, a nie zniknąć.
+pub const DEFAULT_DUCK_PERCENT: u32 = 33;
+/// Domyślny czas ściszania do poziomu ducku.
+pub const DEFAULT_DUCK_RAMP_MS: u32 = 600;
+/// Domyślna pauza między końcem dedykacji a wyciszeniem starego utworu.
+pub const DEFAULT_GAP_MS: u32 = 300;
+/// Domyślny czas wyciszania starego utworu.
+pub const DEFAULT_FADE_OUT_MS: u32 = 400;
+/// Domyślny czas wchodzenia zamówionego utworu do normalnej głośności.
+pub const DEFAULT_START_RAMP_MS: u32 = 800;
+
+/// Zakres ściszenia pod lektorem. 0% to cisza, 100% to brak ściszenia.
+pub const DUCK_PERCENT_RANGE: (u32, u32) = (0, 100);
+/// Zakres czasu pojedynczego przejścia głośności. Zero oznacza skok, a przy imprezie liczy się
+/// każda sekunda — dlatego górna granica jest krótka, a nie „na wszelki wypadek” długa.
+pub const EXECUTE_MS_RANGE: (u32, u32) = (0, 5_000);
 
 /// Zakres tempa mowy w promilach: 500 = pół tempa, 1000 = normalne, 2000 = dwa razy wolniej.
 /// Powyżej 2000 lektor ciągnie tak, że dedykacja przestaje mieścić się w utworze.
@@ -178,6 +211,36 @@ impl Default for PlayerSettings {
     }
 }
 
+/// Ustawienia sekwencji wykonania (PLAN.md, sekcja 7): jak muzyka zachowuje się pod lektorem.
+///
+/// Wszystkie czasy to milisekundy — sekwencja musi umieć zagrać się w mgnieniu oka, więc jednostka
+/// sekund byłaby zbyt gruba. Wartości są do strojenia na żywo; domyślne są bezpieczne.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ExecutionSettings {
+    /// Poziom ducku w procentach amplitudy (patrz [`DEFAULT_DUCK_PERCENT`]).
+    pub duck_percent: u32,
+    /// Jak długo ściszamy muzykę do poziomu ducku.
+    pub duck_ramp_ms: u32,
+    /// Pauza po dedykacji, zanim zaczniemy wyciszać stary utwór.
+    pub gap_ms: u32,
+    /// Jak długo wyciszamy stary utwór do zera.
+    pub fade_out_ms: u32,
+    /// Jak długo zamówiony utwór wjeżdża do normalnej głośności.
+    pub start_ramp_ms: u32,
+}
+
+impl Default for ExecutionSettings {
+    fn default() -> Self {
+        Self {
+            duck_percent: DEFAULT_DUCK_PERCENT,
+            duck_ramp_ms: DEFAULT_DUCK_RAMP_MS,
+            gap_ms: DEFAULT_GAP_MS,
+            fade_out_ms: DEFAULT_FADE_OUT_MS,
+            start_ramp_ms: DEFAULT_START_RAMP_MS,
+        }
+    }
+}
+
 /// Efektywne ustawienia aplikacji DJ-a.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct AppSettings {
@@ -199,6 +262,10 @@ pub struct AppSettings {
     /// zapisze ustawienia, i to z domyślnym adresem.
     #[serde(default)]
     pub player: PlayerSettings,
+    /// Jak zachowuje się muzyka pod lektorem. `default` — starszy interfejs nadal zapisze
+    /// ustawienia, i to z bezpiecznymi wartościami sekwencji.
+    #[serde(default)]
+    pub execute: ExecutionSettings,
 }
 
 impl Default for AppSettings {
@@ -211,6 +278,7 @@ impl Default for AppSettings {
             tts: TtsSettings::default(),
             audio: AudioSettings::default(),
             player: PlayerSettings::default(),
+            execute: ExecutionSettings::default(),
         }
     }
 }
@@ -262,6 +330,17 @@ impl AppSettings {
                     .setting(KEY_PLAYER_BASE_URL)?
                     .unwrap_or(defaults.player.base_url),
             },
+            execute: ExecutionSettings {
+                duck_percent: read_u32(db, KEY_EXECUTE_DUCK_PERCENT)?
+                    .unwrap_or(defaults.execute.duck_percent),
+                duck_ramp_ms: read_u32(db, KEY_EXECUTE_DUCK_RAMP_MS)?
+                    .unwrap_or(defaults.execute.duck_ramp_ms),
+                gap_ms: read_u32(db, KEY_EXECUTE_GAP_MS)?.unwrap_or(defaults.execute.gap_ms),
+                fade_out_ms: read_u32(db, KEY_EXECUTE_FADE_OUT_MS)?
+                    .unwrap_or(defaults.execute.fade_out_ms),
+                start_ramp_ms: read_u32(db, KEY_EXECUTE_START_RAMP_MS)?
+                    .unwrap_or(defaults.execute.start_ramp_ms),
+            },
         };
 
         settings.validate()?;
@@ -311,6 +390,24 @@ impl AppSettings {
         db.set_setting(KEY_AUDIO_OUTPUT_DEVICE, &self.audio.output_device_id)?;
         db.set_setting(KEY_PLAYER_BASE_URL, self.player.base_url.trim())?;
 
+        db.set_setting(
+            KEY_EXECUTE_DUCK_PERCENT,
+            &self.execute.duck_percent.to_string(),
+        )?;
+        db.set_setting(
+            KEY_EXECUTE_DUCK_RAMP_MS,
+            &self.execute.duck_ramp_ms.to_string(),
+        )?;
+        db.set_setting(KEY_EXECUTE_GAP_MS, &self.execute.gap_ms.to_string())?;
+        db.set_setting(
+            KEY_EXECUTE_FADE_OUT_MS,
+            &self.execute.fade_out_ms.to_string(),
+        )?;
+        db.set_setting(
+            KEY_EXECUTE_START_RAMP_MS,
+            &self.execute.start_ramp_ms.to_string(),
+        )?;
+
         Ok(())
     }
 
@@ -348,6 +445,28 @@ impl AppSettings {
         check_audio_device(&self.audio.output_device_id)?;
 
         check_player_url(&self.player.base_url)?;
+
+        check_range(
+            KEY_EXECUTE_DUCK_PERCENT,
+            DUCK_PERCENT_RANGE,
+            self.execute.duck_percent,
+        )?;
+        check_range(
+            KEY_EXECUTE_DUCK_RAMP_MS,
+            EXECUTE_MS_RANGE,
+            self.execute.duck_ramp_ms,
+        )?;
+        check_range(KEY_EXECUTE_GAP_MS, EXECUTE_MS_RANGE, self.execute.gap_ms)?;
+        check_range(
+            KEY_EXECUTE_FADE_OUT_MS,
+            EXECUTE_MS_RANGE,
+            self.execute.fade_out_ms,
+        )?;
+        check_range(
+            KEY_EXECUTE_START_RAMP_MS,
+            EXECUTE_MS_RANGE,
+            self.execute.start_ramp_ms,
+        )?;
 
         Ok(())
     }
@@ -541,11 +660,38 @@ mod tests {
             player: PlayerSettings {
                 base_url: "http://localhost:8880".to_string(),
             },
+            execute: ExecutionSettings {
+                duck_percent: 25,
+                duck_ramp_ms: 700,
+                gap_ms: 250,
+                fade_out_ms: 500,
+                start_ramp_ms: 900,
+            },
         };
 
         settings.save(&db).expect("zapis ustawień");
 
         assert_eq!(AppSettings::load(&db).expect("odczyt ustawień"), settings);
+    }
+
+    #[test]
+    fn the_execution_sequence_stays_within_sane_times() {
+        let mut settings = AppSettings::default();
+        assert!(settings.validate().is_ok());
+
+        settings.execute.duck_percent = 101;
+        assert!(settings.validate().is_err(), "duck ponad 100% amplitudy");
+
+        settings.execute = ExecutionSettings::default();
+        settings.execute.fade_out_ms = 5_001;
+        assert!(settings.validate().is_err(), "wyciszanie dłuższe niż 5 s");
+
+        settings.execute = ExecutionSettings::default();
+        settings.execute.duck_percent = 0;
+        assert!(
+            settings.validate().is_ok(),
+            "cisza pod lektorem jest dopuszczalnym wyborem DJ-a"
+        );
     }
 
     #[test]
@@ -608,6 +754,7 @@ mod tests {
 
         assert_eq!(settings.audio, AudioSettings::default());
         assert_eq!(settings.player, PlayerSettings::default());
+        assert_eq!(settings.execute, ExecutionSettings::default());
     }
 
     #[test]

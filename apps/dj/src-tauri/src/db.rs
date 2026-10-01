@@ -405,7 +405,11 @@ impl Db {
         )
     }
 
-    /// Historia: wykonane i odrzucone, ostatnio zmienione pierwsze.
+    /// Historia: to, co już zeszło z kolejki gotowych — grające, wykonane i odrzucone,
+    /// ostatnio zmienione pierwsze.
+    ///
+    /// „Grające” należy tu tak samo jak pozostałe: po wykonaniu prośba schodzi z kolejki gotowych,
+    /// a DJ musi widzieć, co poszło na antenę — inaczej zniknęłaby z ekranu w środku utworu.
     pub fn request_history(&self, limit: u32) -> Result<Vec<QueuedRequest>, DbError> {
         let conn = self.lock()?;
 
@@ -413,11 +417,12 @@ impl Db {
             &conn,
             &format!(
                 "SELECT {QUEUE_COLUMNS} FROM requests r JOIN tracks t ON t.id = r.track_id
-                 WHERE r.status IN (?1, ?2)
+                 WHERE r.status IN (?1, ?2, ?3)
                  ORDER BY r.updated_at DESC
-                 LIMIT ?3"
+                 LIMIT ?4"
             ),
             params![
+                RequestStatus::Playing.as_str(),
                 RequestStatus::Done.as_str(),
                 RequestStatus::Rejected.as_str(),
                 limit
@@ -601,6 +606,36 @@ impl Db {
         transaction.commit()?;
 
         Ok(true)
+    }
+
+    /// Ścieżka pliku utworu zamówionego w prośbie.
+    ///
+    /// Sekwencja wykonania potrzebuje **pliku**, a nie metadanych — kolejka pokazuje tylko tytuł
+    /// i wykonawcę. `None` oznacza, że prośby nie ma (albo zniknął jej utwór).
+    pub fn request_track_path(&self, id: i64) -> Result<Option<String>, DbError> {
+        let conn = self.lock()?;
+
+        let path = conn
+            .query_row(
+                "SELECT t.path FROM requests r JOIN tracks t ON t.id = r.track_id WHERE r.id = ?1",
+                params![id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+
+        Ok(path)
+    }
+
+    /// Ustawia status prośby. Wołane przez sekwencję wykonania, gdy utwór rusza na antenie.
+    pub fn set_request_status(&self, id: i64, status: RequestStatus) -> Result<(), DbError> {
+        let conn = self.lock()?;
+
+        conn.execute(
+            "UPDATE requests SET status = ?2, updated_at = ?3 WHERE id = ?1",
+            params![id, status.as_str(), now_ms()],
+        )?;
+
+        Ok(())
     }
 
     /// Dokąd wysłać zmianę statusu prośby. `None` oznacza, że prośby nie ma w bazie.

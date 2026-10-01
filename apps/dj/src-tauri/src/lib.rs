@@ -3,6 +3,8 @@
 mod audio;
 mod clips;
 mod db;
+// Sekwencja wykonania: duck, dedykacja, wyciszenie starego utworu i wejście zamówionego.
+mod execute;
 mod library;
 mod logging;
 mod net;
@@ -14,6 +16,9 @@ mod settings;
 // Publiczny, bo kontrakt lektora (`TtsProvider`) jest zamierzony jako punkt wejścia dla silników
 // TTS — dopóki nic go nie woła z wewnątrz, prywatny moduł zgłaszałby martwy kod.
 pub mod tts;
+// Czysta logika ramp głośności (duck, fade-out, wejście zamówionego utworu) — bez HTTP,
+// bez stanu, w pełni testowalna.
+mod volume;
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -25,6 +30,7 @@ use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 
 use crate::db::{Db, DbError, LibraryFolder, QueuedRequest};
+use crate::execute::{ExecutionError, ExecutionPlan};
 use crate::library::{LibraryError, ScanSummary};
 use crate::player::{PlayerAdapter, PlayerStatus};
 use crate::settings::{AppSettings, validate_tts};
@@ -589,6 +595,136 @@ fn player_adapter(state: &AppState) -> Result<crate::player::BeefwebAdapter, Str
     crate::player::BeefwebAdapter::new(&base_url).map_err(|error| error.to_string())
 }
 
+/// Wykonuje prośbę: ścisza muzykę, czyta dedykację nad nią, wycisza stary utwór i wpuszcza
+/// zamówiony (PLAN.md, sekcja 7).
+///
+/// Cała sekwencja idzie na jednym wątku blokującym — składa się z żądań HTTP i czekania, więc
+/// nie ma prawa zbliżyć się do wątku UI.
+#[tauri::command(rename_all = "snake_case")]
+async fn execute_request(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    request_id: i64,
+) -> Result<(), String> {
+    // Klip musi być gotowy **przed** ściszeniem czegokolwiek: inaczej zostalibyśmy w eterze
+    // z ciszą i bez dedykacji.
+    let clip = {
+        let db = Arc::clone(&state.db);
+
+        run_db(move || db.tts_clip_path(request_id)).await?
+    };
+    let clip_path = clip.ok_or_else(|| CLIP_NOT_READY.to_string())?;
+
+    let track = {
+        let db = Arc::clone(&state.db);
+
+        run_db(move || db.request_track_path(request_id)).await?
+    };
+    let Some(track_path) = track else {
+        return Err(format!("prośba {request_id} nie ma utworu w bibliotece"));
+    };
+
+    let (base_url, execute_settings, device_id, tts_volume) = {
+        let settings = state
+            .settings
+            .lock()
+            .map_err(|_| SETTINGS_UNAVAILABLE.to_string())?;
+
+        (
+            settings.player.base_url.clone(),
+            settings.execute.clone(),
+            settings.audio.output_device_id.clone(),
+            crate::audio::playback_volume(settings.tts.tuning.volume_percent),
+        )
+    };
+
+    let clips = Arc::clone(&state.audio);
+    let db = Arc::clone(&state.db);
+    let handle = app.clone();
+    let clip_path = PathBuf::from(clip_path);
+
+    run_blocking(move || -> Result<(), ExecutionError> {
+        let adapter = player::BeefwebAdapter::new(&base_url)?;
+        let start = adapter.status()?;
+
+        // Poziom normalny zapisujemy, **zanim** go ruszymy: gdyby aplikacja padła w trakcie
+        // sekwencji, po restarcie wiemy, do czego wrócić.
+        db.set_setting(
+            crate::settings::KEY_EXECUTE_NORMAL_VOLUME_DB,
+            &start.volume_db.to_string(),
+        )?;
+
+        let plan = ExecutionPlan {
+            request_id,
+            track_path,
+            clip_path,
+            device_id,
+            tts_volume,
+            settings: execute_settings,
+            start,
+        };
+
+        crate::execute::run_sequence(&handle, &adapter, &clips, &plan)?;
+
+        // Utwór ruszył na antenie — prośba nie czeka już na wykonanie.
+        db.set_request_status(request_id, RequestStatus::Playing)?;
+        db.set_setting(crate::settings::KEY_EXECUTE_NORMAL_VOLUME_DB, "")?;
+
+        Ok(())
+    })
+    .await
+}
+
+/// Po nagłym zamknięciu aplikacji w trakcie sekwencji głośność odtwarzacza mogła zostać na
+/// poziomie ducku. Znacznik zapisany przed ściszeniem mówi nam, do czego wrócić.
+///
+/// Znacznik zdejmujemy dopiero **po** udanym przywróceniu — inaczej jedno niepowodzenie
+/// (odtwarzacz wyłączony przy starcie) skazałoby głośność na pozostanie w ducku.
+fn recover_interrupted_sequence(db: Arc<Db>, base_url: String) {
+    tauri::async_runtime::spawn(async move {
+        let stored = {
+            let db = Arc::clone(&db);
+
+            run_db(move || db.setting(crate::settings::KEY_EXECUTE_NORMAL_VOLUME_DB)).await
+        };
+
+        let Ok(Some(raw)) = stored else {
+            return;
+        };
+
+        // Pusty wpis to ślad po zakończonej sekwencji — nie ma czego przywracać.
+        let Ok(normal_db) = raw.trim().parse::<f64>() else {
+            return;
+        };
+
+        warn!(
+            normal_db,
+            "sekwencja wykonania została przerwana — przywracam głośność odtwarzacza"
+        );
+
+        let restored =
+            run_blocking(move || player::BeefwebAdapter::new(&base_url)?.set_volume_db(normal_db))
+                .await;
+
+        if let Err(error) = restored {
+            warn!(
+                error,
+                "nie udało się przywrócić głośności — znacznik zostaje na następny start"
+            );
+
+            return;
+        }
+
+        let db = Arc::clone(&db);
+
+        if let Err(error) =
+            run_db(move || db.set_setting(crate::settings::KEY_EXECUTE_NORMAL_VOLUME_DB, "")).await
+        {
+            warn!(error, "nie udało się wyczyścić znacznika sekwencji");
+        }
+    });
+}
+
 /// Bieżący stan odtwarzacza (polling z interfejsu).
 #[tauri::command]
 async fn player_status(state: tauri::State<'_, AppState>) -> Result<PlayerStatusView, String> {
@@ -980,6 +1116,28 @@ fn emit_scan_progress(app: &tauri::AppHandle, progress: &ScanProgress) {
 
 /// Uruchamia operację na bazie na wątku roboczym — dostęp do dysku nigdy nie idzie przez
 /// wątek interfejsu (AGENTS.md, zasady architektury).
+/// Wykonuje dowolną blokującą pracę poza wątkiem UI i sprowadza błąd do tekstu dla interfejsu.
+async fn run_blocking<T, E, F>(operation: F) -> Result<T, String>
+where
+    T: Send + 'static,
+    E: std::error::Error + Send + 'static,
+    F: FnOnce() -> Result<T, E> + Send + 'static,
+{
+    match tauri::async_runtime::spawn_blocking(operation).await {
+        Ok(Ok(value)) => Ok(value),
+        Ok(Err(error)) => {
+            error!(error = %error, "operacja w tle nie powiodła się");
+
+            Err(error.to_string())
+        }
+        Err(join_error) => {
+            error!(error = %join_error, "wątek w tle zakończył się błędem");
+
+            Err("operacja w tle nie powiodła się".to_string())
+        }
+    }
+}
+
 /// Wykonuje blokujące wywołanie odtwarzacza poza wątkiem UI (AGENTS.md).
 ///
 /// Żądanie do beefweb może wisieć do timeoutu, więc nie ma prawa zatrzymać interfejsu DJ-a.
@@ -1062,6 +1220,7 @@ pub fn run() {
             // Serwer kiosków dostaje te same ustawienia co interfejs, żeby zmiana PIN-u
             // albo limitów działała od razu, bez restartu aplikacji.
             let port = settings.port;
+            let base_url = settings.player.base_url.clone();
             let settings = Arc::new(Mutex::new(settings));
             let (ui_events, ui_rx) = mpsc::unbounded_channel();
             let db = Arc::new(db);
@@ -1104,6 +1263,10 @@ pub fn run() {
             let clips = Arc::new(clips::ClipJobs::new());
             let audio = Arc::new(audio::VoiceOverPlayer::new());
 
+            // Sekwencja przerwana restarted aplikacji mogła zostawić głośność na poziomie ducku.
+            let recover_db = Arc::clone(&db);
+            let recover_base_url = base_url.clone();
+
             app.manage(AppState {
                 db,
                 db_path,
@@ -1115,6 +1278,9 @@ pub fn run() {
                 clips,
                 audio,
             });
+
+            recover_interrupted_sequence(recover_db, recover_base_url);
+
             info!("aplikacja DJ-a gotowa");
 
             Ok(())
@@ -1149,7 +1315,8 @@ pub fn run() {
             preview_voice,
             player_status,
             player_play_now,
-            player_play_next
+            player_play_next,
+            execute_request
         ])
         .run(tauri::generate_context!())
         .expect("nie udało się uruchomić aplikacji ANON DJ");

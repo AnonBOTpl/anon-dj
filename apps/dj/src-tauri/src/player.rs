@@ -11,6 +11,8 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
+use crate::volume::{MAX_VOLUME_DB, clamp_db};
+
 /// Prefiks adresu API odtwarzacza: `{base}/api/player` itd.
 const API_PREFIX: &str = "/api";
 
@@ -84,6 +86,8 @@ pub struct PlayerStatus {
     pub path: Option<String>,
     pub position_seconds: f64,
     pub duration_seconds: f64,
+    /// Bieżący wolumen odtwarzacza w decybelach (`0.0` = maksimum, `-100.0` = cisza).
+    pub volume_db: f64,
 }
 
 impl PlayerStatus {
@@ -97,6 +101,8 @@ impl PlayerStatus {
             path: None,
             position_seconds: 0.0,
             duration_seconds: 0.0,
+            // Poziom neutralny: nie znamy głośności odtwarzacza, a zero to maksimum skali.
+            volume_db: MAX_VOLUME_DB,
         }
     }
 }
@@ -112,6 +118,20 @@ pub trait PlayerAdapter: Send + Sync {
 
     /// Dodaje plik do kolejki i od razu go uruchamia.
     fn play_now(&self, path: &str) -> Result<(), PlayerError>;
+
+    /// Ustawia głośność odtwarzacza (decybele, `0.0` = maksimum).
+    ///
+    /// Rampy wysyłają tę wartość krok po kroku — patrz [`crate::volume`].
+    fn set_volume_db(&self, volume_db: f64) -> Result<(), PlayerError>;
+
+    /// Włącza albo zdejmuje „stop po bieżącym utworze”.
+    ///
+    /// Włączamy to na czas sekwencji, żeby utwór, który skończy się pod lektorem, **zatrzymał**
+    /// odtwarzanie, a nie wciągnął pod głos następnej pozycji playlisty (PLAN.md, sekcja 7).
+    fn set_stop_after_current(&self, stop: bool) -> Result<(), PlayerError>;
+
+    /// Zatrzymuje odtwarzanie. Bieżący utwór zostaje wybrany, ale milknie.
+    fn stop(&self) -> Result<(), PlayerError>;
 }
 
 /// Adapter foobar2000 + beefweb.
@@ -316,6 +336,7 @@ impl PlayerAdapter for BeefwebAdapter {
             } else {
                 0.0
             },
+            volume_db: clamp_db(raw.volume.value),
         })
     }
 
@@ -340,6 +361,27 @@ impl PlayerAdapter for BeefwebAdapter {
         )?;
 
         self.post_empty("/player/next")
+    }
+
+    fn set_volume_db(&self, volume_db: f64) -> Result<(), PlayerError> {
+        // Przycinamy u siebie: wysłanie wartości spoza skali beefweba skończyłoby się błędem
+        // w środku sekwencji, a rampę da się policzyć i tak w tym zakresie.
+        let volume_db = clamp_db(volume_db);
+
+        self.post_json("/player", &serde_json::json!({ "volume": volume_db }))
+    }
+
+    fn set_stop_after_current(&self, stop: bool) -> Result<(), PlayerError> {
+        self.post_json(
+            "/player",
+            &serde_json::json!({
+                "options": [{ "id": "stopAfterCurrentTrack", "value": stop }]
+            }),
+        )
+    }
+
+    fn stop(&self) -> Result<(), PlayerError> {
+        self.post_empty("/player/stop")
     }
 }
 
@@ -399,6 +441,14 @@ struct RawPlayerState {
     active_item: RawActiveItem,
     #[serde(rename = "playbackState")]
     playback_state: String,
+    #[serde(default)]
+    volume: RawVolume,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct RawVolume {
+    #[serde(default)]
+    value: f64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -488,7 +538,7 @@ mod tests {
 
     #[test]
     fn status_is_read_from_a_real_http_answer() {
-        let body = r#"{"player":{"activeItem":{"columns":["TROUBLE","2 VIBEZ","F:\\MP3\\2 VIBEZ - TROUBLE.MP3"],"duration":198.6,"index":5,"playlistId":"p1","playlistIndex":0,"position":1.04},"playbackState":"playing"}}"#;
+        let body = r#"{"player":{"activeItem":{"columns":["TROUBLE","2 VIBEZ","F:\\MP3\\2 VIBEZ - TROUBLE.MP3"],"duration":198.6,"index":5,"playlistId":"p1","playlistIndex":0,"position":1.04},"playbackState":"playing","volume":{"isMuted":false,"max":0.0,"min":-100.0,"type":"db","value":-6.0}}}"#;
         let (base_url, handle) = serve_once(body, "200 OK");
 
         let adapter = BeefwebAdapter::new(&base_url).expect("adapter");
@@ -503,6 +553,10 @@ mod tests {
             Some("F:\\MP3\\2 VIBEZ - TROUBLE.MP3")
         );
         assert!((status.duration_seconds - 198.6).abs() < 0.001);
+        assert!(
+            (status.volume_db - (-6.0)).abs() < 0.001,
+            "wolumen odtwarzacza jest w decybelach"
+        );
 
         let request = handle.join().expect("wątek serwera");
         assert!(request.starts_with("GET /api/player?columns="), "{request}");

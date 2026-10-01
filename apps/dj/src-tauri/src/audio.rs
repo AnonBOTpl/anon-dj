@@ -166,6 +166,8 @@ pub fn normalize_device_id(device_id: &str) -> &str {
 struct Active {
     /// Numer odtwarzania — watcher starszego nie może wygasić nowszego.
     serial: u64,
+    /// Co leci — po tym sekwencja wykonania poznaje, że dedykacja się skończyła.
+    target: PlaybackTarget,
     /// Trzyma strumień przy życiu; po zwolnieniu dźwięk milknie.
     _sink: MixerDeviceSink,
     /// Kolejka odtwarzania. Musi żyć razem ze strumieniem: zwolnienie odtwarzacza ucina dźwięk,
@@ -224,6 +226,7 @@ impl VoiceOverPlayer {
             Ok(mut active) => {
                 *active = Some(Active {
                     serial,
+                    target,
                     _sink: sink,
                     player: Arc::clone(&player),
                 });
@@ -240,6 +243,17 @@ impl VoiceOverPlayer {
         self.watch(app.clone(), serial, player);
 
         Ok(())
+    }
+
+    /// Co leci w tej chwili; `None` oznacza ciszę.
+    ///
+    /// Sekwencja wykonania czeka na koniec dedykacji, pytając właśnie o to — stan jest ustawiany
+    /// od razu w [`VoiceOverPlayer::play`] i czyszczony, gdy klip dobiegnie końca.
+    pub fn current(&self) -> Option<PlaybackTarget> {
+        match self.active.lock() {
+            Ok(active) => active.as_ref().map(|current| current.target),
+            Err(_) => None,
+        }
     }
 
     /// Zatrzymuje odtwarzanie (jeśli coś leci).
@@ -385,6 +399,13 @@ mod tests {
                 preview: false
             }
         );
+    }
+
+    #[test]
+    fn nothing_is_playing_before_anything_starts() {
+        let player = VoiceOverPlayer::new();
+
+        assert_eq!(player.current(), None);
     }
 
     #[test]
