@@ -37,6 +37,9 @@ pub const KEY_TTS_NOISE_W: &str = "tts.noise_w";
 pub const KEY_TTS_VOLUME: &str = "tts.volume";
 /// Klucz ustawienia z pauzą między zdaniami lektora.
 pub const KEY_TTS_SENTENCE_SILENCE: &str = "tts.sentence_silence_ms";
+/// Klucz ustawienia z urządzeniem wyjściowym voice-overu. Trzymamy **identyfikator**
+/// urządzenia, bo przeżywa restart systemu i ponowne podłączenie karty.
+pub const KEY_AUDIO_OUTPUT_DEVICE: &str = "audio.output_device_id";
 
 /// PIN, od którego startuje świeża instalacja. DJ może i powinien go zmienić w ustawieniach.
 pub const DEFAULT_PIN: &str = "123456";
@@ -62,6 +65,10 @@ pub const CONFIRMATION_SECONDS_RANGE: (u32, u32) = (5, 300);
 pub const DEFAULT_TTS_VOICE: &str = "justyna";
 /// Najdłuższa dopuszczalna nazwa głosu.
 pub const TTS_VOICE_MAX_CHARS: usize = 64;
+
+/// Najdłuższa dopuszczalna nazwa urządzenia wyjściowego. Nazwy kart dźwiękowych bywają długie
+/// (producent, model, tryb), ale nie aż tak — a wpis bez ograniczenia to zaproszenie do błędu.
+pub const AUDIO_DEVICE_MAX_CHARS: usize = 128;
 
 /// Zakres tempa mowy w promilach: 500 = pół tempa, 1000 = normalne, 2000 = dwa razy wolniej.
 /// Powyżej 2000 lektor ciągnie tak, że dedykacja przestaje mieścić się w utworze.
@@ -102,6 +109,9 @@ pub enum SettingsError {
 
     #[error("nazwa głosu lektora jest nieprawidłowa: „{0}”")]
     InvalidVoice(String),
+
+    #[error("nazwa urządzenia wyjściowego jest za długa (limit {AUDIO_DEVICE_MAX_CHARS} znaków)")]
+    InvalidAudioDevice,
 }
 
 impl SettingsError {
@@ -132,6 +142,14 @@ impl Default for TtsSettings {
     }
 }
 
+/// Ustawienia dźwięku: gdzie ma wyjść voice-over.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct AudioSettings {
+    /// Identyfikator urządzenia wyjściowego. **Pusty oznacza domyślne urządzenie systemowe** —
+    /// i tak startuje świeża instalacja, żeby aplikacja działała bez zaglądania do ustawień.
+    pub output_device_id: String,
+}
+
 /// Efektywne ustawienia aplikacji DJ-a.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct AppSettings {
@@ -145,6 +163,10 @@ pub struct AppSettings {
     /// ustawienia bez błędu.
     #[serde(default)]
     pub tts: TtsSettings,
+    /// Gdzie ma wyjść voice-over. `default` — starszy interfejs bez tego pola nadal zapisze
+    /// ustawienia, i to z domyślnym urządzeniem systemowym.
+    #[serde(default)]
+    pub audio: AudioSettings,
 }
 
 impl Default for AppSettings {
@@ -155,6 +177,7 @@ impl Default for AppSettings {
             confirmation_seconds: DEFAULT_CONFIRMATION_SECONDS,
             limits: Limits::default(),
             tts: TtsSettings::default(),
+            audio: AudioSettings::default(),
         }
     }
 }
@@ -195,6 +218,11 @@ impl AppSettings {
                     sentence_silence_ms: read_u32(db, KEY_TTS_SENTENCE_SILENCE)?
                         .unwrap_or(defaults.tts.tuning.sentence_silence_ms),
                 },
+            },
+            audio: AudioSettings {
+                output_device_id: db
+                    .setting(KEY_AUDIO_OUTPUT_DEVICE)?
+                    .unwrap_or(defaults.audio.output_device_id),
             },
         };
 
@@ -241,6 +269,8 @@ impl AppSettings {
             KEY_TTS_SENTENCE_SILENCE,
             &self.tts.tuning.sentence_silence_ms.to_string(),
         )?;
+
+        db.set_setting(KEY_AUDIO_OUTPUT_DEVICE, &self.audio.output_device_id)?;
 
         Ok(())
     }
@@ -301,8 +331,20 @@ impl AppSettings {
             self.tts.tuning.sentence_silence_ms,
         )?;
 
+        check_audio_device(&self.audio.output_device_id)?;
+
         Ok(())
     }
+}
+
+/// Identyfikator urządzenia wyjściowego trafia prosto do interfejsu audio, więc ograniczamy jego
+/// długość. Pusty jest w porządku — to znaczy „domyślne urządzenie systemowe”.
+fn check_audio_device(device_id: &str) -> Result<(), SettingsError> {
+    if device_id.chars().count() > AUDIO_DEVICE_MAX_CHARS {
+        return Err(SettingsError::InvalidAudioDevice);
+    }
+
+    Ok(())
 }
 
 /// Nazwa głosu musi być identyfikatorem pliku — trafia potem do ścieżek i klucza pamięci
@@ -427,11 +469,56 @@ mod tests {
                     sentence_silence_ms: 150,
                 },
             },
+            audio: AudioSettings {
+                output_device_id: "wasapi:Głośniki (Realtek Audio)".to_string(),
+            },
         };
 
         settings.save(&db).expect("zapis ustawień");
 
         assert_eq!(AppSettings::load(&db).expect("odczyt ustawień"), settings);
+    }
+
+    #[test]
+    fn a_fresh_install_plays_the_voice_over_on_the_default_device() {
+        let settings = AppSettings::default();
+
+        assert!(settings.validate().is_ok());
+        assert_eq!(settings.audio.output_device_id, "");
+    }
+
+    #[test]
+    fn an_older_interface_without_audio_fields_still_saves() {
+        let settings: AppSettings = serde_json::from_str(
+            r#"{
+                "pin": "123456",
+                "port": 8790,
+                "confirmation_seconds": 20,
+                "limits": {
+                    "dedication_max_chars": 400,
+                    "guest_name_max_chars": 40,
+                    "search_query_max_chars": 80
+                }
+            }"#,
+        )
+        .expect("starszy interfejs bez pola audio");
+
+        assert_eq!(settings.audio, AudioSettings::default());
+    }
+
+    #[test]
+    fn an_absurdly_long_device_name_is_rejected() {
+        let settings = AppSettings {
+            audio: AudioSettings {
+                output_device_id: "x".repeat(AUDIO_DEVICE_MAX_CHARS + 1),
+            },
+            ..AppSettings::default()
+        };
+
+        assert!(matches!(
+            settings.validate(),
+            Err(SettingsError::InvalidAudioDevice)
+        ));
     }
 
     #[test]

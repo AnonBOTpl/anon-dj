@@ -49,3 +49,9 @@ futures-util = "0.3.34"
 # `sherpa-onnx` linkuje gotowe biblioteki statyczne pobierane raz w buildzie (skrypt budujący
 # używa do tego `ureq`/`tar`/`bzip2`/`zip`) — bez dodatkowych narzędzi i bez AVX2. (PLAN.md, sekcja 8)
 sherpa-onnx = "1.13.8"
+# Odtwarzanie klipu lektora na wybranym urządzeniu wyjściowym (PLAN.md, sekcja 8). `rodio` daje
+# gotowe otwieranie strumienia (na Windows przez WASAPI) i dekodowanie WAV; własna implementacja
+# oznaczałaby pisanie dekodera i obsługę formatów próbek, czyli miejsce na błędy w najbardziej
+# słyszalnym punkcie aplikacji. Wyłączamy domyślne dekodery (mp3/mp4/vorbis/flac), bo gramy
+# wyłącznie własne WAV-y, a `tracing` kieruje błędy strumienia do naszego logu.
+rodio = { version = "0.22.2", default-features = false, features = ["playback", "wav", "tracing"] }

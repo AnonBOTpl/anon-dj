@@ -1,5 +1,6 @@
 //! Aplikacja DJ-a ANON DJ: konfiguracja uruchomienia, stan współdzielony i komendy Tauri.
 
+mod audio;
 mod clips;
 mod db;
 mod library;
@@ -39,6 +40,9 @@ const SETTINGS_UNAVAILABLE: &str = "ustawienia są chwilowo niedostępne";
 /// Komunikat zwracany, gdy nie ma czym przeczytać dedykacji.
 const TTS_UNAVAILABLE: &str = "lektor jest niedostępny";
 
+/// Komunikat zwracany, gdy DJ próbuje odsłuchać prośbę, której klip jeszcze się liczy.
+const CLIP_NOT_READY: &str = "voice-over jeszcze się liczy";
+
 /// Stan aplikacji współdzielony między komendami Tauri.
 struct AppState {
     db: Arc<Db>,
@@ -57,29 +61,8 @@ struct AppState {
     tts: piper::TtsRuntime,
     /// Zlecenia generowania klipów lektora w tle wraz z postępem dla interfejsu.
     clips: Arc<clips::ClipJobs>,
-}
-
-impl AppState {
-    fn new(
-        db: Arc<Db>,
-        db_path: PathBuf,
-        log_dir: PathBuf,
-        settings: Arc<Mutex<AppSettings>>,
-        server: Arc<net::Server>,
-        tts: piper::TtsRuntime,
-        clips: Arc<clips::ClipJobs>,
-    ) -> Self {
-        Self {
-            db,
-            db_path,
-            log_dir,
-            settings,
-            scanning: Arc::new(AtomicBool::new(false)),
-            server,
-            tts,
-            clips,
-        }
-    }
+    /// Odsłuch voice-overu na wybranym urządzeniu wyjściowym.
+    audio: Arc<audio::VoiceOverPlayer>,
 }
 
 /// Stan lektora dla interfejsu DJ-a.
@@ -162,6 +145,73 @@ async fn start_clip_generation(
         .start(app.clone(), db, provider, tuning, request_id, text);
 
     Ok(())
+}
+
+/// Urządzenia wyjściowe, na których DJ może odsłuchać voice-over.
+///
+/// Wypisywanie urządzeń sięga do systemu, więc idzie poza wątek interfejsu — okno nie ma prawa
+/// zamarznąć w trakcie imprezy, nawet na chwilę.
+#[tauri::command]
+async fn audio_devices() -> Result<Vec<audio::OutputDevice>, String> {
+    tauri::async_runtime::spawn_blocking(audio::output_devices)
+        .await
+        .map_err(|error| error.to_string())?
+        .map_err(|error| error.to_string())
+}
+
+/// Odsłuchuje gotowy voice-over prośby na urządzeniu wyjściowym z ustawień.
+///
+/// To przycisk „Odsłuchaj” z PLAN.md (sekcja 8): DJ sprawdza dedykację i brzmienie głosu, zanim
+/// puści ją na antenę. Klipu nie liczymy na nowo — bierzemy gotowy plik i tylko go odtwarzamy.
+#[tauri::command(rename_all = "snake_case")]
+async fn play_dedication(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    request_id: i64,
+) -> Result<(), String> {
+    let path = {
+        let db = Arc::clone(&state.db);
+
+        run_db(move || db.tts_clip_path(request_id)).await?
+    }
+    .ok_or_else(|| CLIP_NOT_READY.to_string())?;
+
+    let (device, volume) = {
+        let settings = state
+            .settings
+            .lock()
+            .map_err(|_| SETTINGS_UNAVAILABLE.to_string())?;
+
+        (
+            settings.audio.output_device_id.clone(),
+            audio::playback_volume(settings.tts.tuning.volume_percent),
+        )
+    };
+
+    // Otwarcie strumienia audio to operacja systemowa — też poza wątkiem interfejsu.
+    let player = Arc::clone(&state.audio);
+    let handle = app.clone();
+
+    tauri::async_runtime::spawn_blocking(move || {
+        player.play(&handle, request_id, Path::new(&path), &device, volume)
+    })
+    .await
+    .map_err(|error| error.to_string())?
+    .map_err(|error| error.to_string())
+}
+
+/// Zatrzymuje odsłuch voice-overu.
+#[tauri::command]
+async fn stop_dedication(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+) -> Result<(), String> {
+    let player = Arc::clone(&state.audio);
+    let handle = app.clone();
+
+    tauri::async_runtime::spawn_blocking(move || player.stop(&handle))
+        .await
+        .map_err(|error| error.to_string())
 }
 
 /// Stan połączeń z kioskami pokazywany w pasku statusu DJ-a.
@@ -848,10 +898,19 @@ pub fn run() {
             };
 
             let clips = Arc::new(clips::ClipJobs::new());
+            let audio = Arc::new(audio::VoiceOverPlayer::new());
 
-            app.manage(AppState::new(
-                db, db_path, log_dir, settings, server, tts, clips,
-            ));
+            app.manage(AppState {
+                db,
+                db_path,
+                log_dir,
+                settings,
+                scanning: Arc::new(AtomicBool::new(false)),
+                server,
+                tts,
+                clips,
+                audio,
+            });
             info!("aplikacja DJ-a gotowa");
 
             Ok(())
@@ -878,7 +937,10 @@ pub fn run() {
             move_request,
             tts_status,
             clip_states,
-            generate_clip
+            generate_clip,
+            audio_devices,
+            play_dedication,
+            stop_dedication
         ])
         .run(tauri::generate_context!())
         .expect("nie udało się uruchomić aplikacji ANON DJ");

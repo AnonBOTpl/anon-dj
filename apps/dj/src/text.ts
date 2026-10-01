@@ -56,6 +56,10 @@ export const ui = {
       unavailable: "Lektor niedostępny — przeczytaj dedykację z ekranu.",
       generateError: "Nie udało się zamówić voice-overu:",
       percentSuffix: "%",
+      play: "Odsłuchaj",
+      stop: "Zatrzymaj",
+      playError: "Nie udało się odtworzyć voice-overu:",
+      stopError: "Nie udało się zatrzymać odtwarzania:",
     },
     // Podpisy statusów prośby — pokazujemy je słowem, nie kodem.
     statuses: {
@@ -81,6 +85,12 @@ export const ui = {
     confirmationSecondsLabel: "Powrót ekranu potwierdzenia (sekundy)",
     confirmationSecondsHint: "Po ilu sekundach kiosk sam wróci do szukania, żeby kolejny gość mógł pisać. Ten czas dostaje kiosk przy parowaniu.",
     confirmationSecondsError: "Czas musi być liczbą z zakresu 5–300 sekund.",
+    audioDeviceLabel: "Urządzenie wyjściowe voice-overu",
+    audioDeviceHint: "Voice-over musi wyjść tym samym wyjściem co muzyka — inaczej gość usłyszy lektora z innych głośników niż utwór.",
+    audioDeviceDefault: "Domyślne urządzenie systemowe",
+    audioDeviceDefaultTag: "domyślne",
+    audioDeviceMissing: "Wybrane urządzenie jest teraz niepodłączone",
+    audioDeviceError: "Nie udało się wczytać listy urządzeń:",
     dedicationLimitLabel: "Limit dedykacji (znaki)",
     dedicationLimitHint: "Ile znaków może wpisać gość. Ten sam limit dostaje kiosk przy parowaniu.",
     guestNameLimitLabel: "Limit imienia gościa (znaki)",

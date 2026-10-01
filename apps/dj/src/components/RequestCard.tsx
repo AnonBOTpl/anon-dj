@@ -7,6 +7,8 @@ import {
   LoaderCircle,
   Mic,
   Pencil,
+  Play,
+  Square,
   TriangleAlert,
   Undo2,
   User,
@@ -38,16 +40,26 @@ function VoiceOverStatus({
   state,
   ttsAvailable,
   disabled,
+  playing,
   onGenerate,
+  onTogglePlayback,
 }: {
   state: VoiceOverState;
   ttsAvailable: boolean;
   disabled: boolean;
+  /** Czy to właśnie tego voice-overu słuchamy teraz. */
+  playing: boolean;
   onGenerate?: () => void;
+  onTogglePlayback?: () => void;
 }) {
   const generate = (event: MouseEvent<HTMLButtonElement>) => {
     event.stopPropagation();
     onGenerate?.();
+  };
+
+  const togglePlayback = (event: MouseEvent<HTMLButtonElement>) => {
+    event.stopPropagation();
+    onTogglePlayback?.();
   };
 
   if (state.status === "missing") {
@@ -115,10 +127,26 @@ function VoiceOverStatus({
   }
 
   return (
-    <p className="mt-2 flex items-center gap-1.5 text-xs text-emerald-400">
+    <div className="mt-2 flex items-center gap-2 text-xs text-emerald-400">
       <CircleCheck className="h-3 w-3 shrink-0" />
       {ui.queue.voiceOver.ready}
-    </p>
+
+      {onTogglePlayback !== undefined && (
+        <button
+          type="button"
+          onClick={togglePlayback}
+          disabled={disabled}
+          className={smallButton}
+        >
+          {playing ? (
+            <Square className="h-3.5 w-3.5" />
+          ) : (
+            <Play className="h-3.5 w-3.5" />
+          )}
+          {playing ? ui.queue.voiceOver.stop : ui.queue.voiceOver.play}
+        </button>
+      )}
+    </div>
   );
 }
 
@@ -143,6 +171,10 @@ type RequestCardProps = {
   onGenerateVoiceOver?: () => void;
   /** Czy lektor jest w ogóle dostępny; bez tego przycisk tylko wprowadzałby w błąd. */
   ttsAvailable?: boolean;
+  /** Czy to właśnie tego voice-overu słuchamy teraz. */
+  playing?: boolean;
+  /** Odsłuch voice-overu — startuje albo zatrzymuje. */
+  onTogglePlayback?: () => void;
 };
 
 /**
@@ -160,6 +192,8 @@ export function RequestCard({
   voiceOver,
   onGenerateVoiceOver,
   ttsAvailable = false,
+  playing = false,
+  onTogglePlayback,
 }: RequestCardProps) {
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState(request.dedication);
@@ -245,7 +279,9 @@ export function RequestCard({
           state={voiceOver}
           ttsAvailable={ttsAvailable}
           disabled={disabled}
+          playing={playing}
           onGenerate={onGenerateVoiceOver}
+          onTogglePlayback={onTogglePlayback}
         />
       )}
 

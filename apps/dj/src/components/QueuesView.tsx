@@ -6,13 +6,23 @@ import { ArrowDown, ArrowUp, Ban, Check } from "lucide-react";
 import { Panel } from "./Panel";
 import { RequestCard } from "./RequestCard";
 import { ui } from "../text";
-import type { AppSettings, ClipProgress, QueuedRequest, RequestStatus, VoiceOverState } from "../types";
+import type {
+  AppSettings,
+  ClipProgress,
+  PlaybackStatus,
+  QueuedRequest,
+  RequestStatus,
+  VoiceOverState,
+} from "../types";
 
 /** Zdarzenie o zmianie kolejki — musi zgadzać się ze stałą `EVENT_REQUESTS_CHANGED` w warstwie Rust. */
 const EVENT_REQUESTS_CHANGED = "requests://changed";
 
 /** Zdarzenie z postępem generowania voice-overu — `EVENT_CLIP_PROGRESS` w warstwie Rust. */
 const EVENT_CLIP_PROGRESS = "clips://progress";
+
+/** Zdarzenie o odtwarzanym voice-overze — `EVENT_PLAYBACK` w warstwie Rust. */
+const EVENT_PLAYBACK = "audio://playback";
 
 /** Limit dedykacji z protokołu — używany tylko do czasu wczytania ustawień DJ-a. */
 const FALLBACK_DEDICATION_CHARS = 400;
@@ -63,6 +73,9 @@ export function QueuesView() {
   const [error, setError] = useState<string | null>(null);
   const [clipStates, setClipStates] = useState<Record<number, ClipProgress>>({});
   const [ttsAvailable, setTtsAvailable] = useState(false);
+  // Który voice-over leci teraz. Trzymamy to po zdarzeniach z warstwy Rust, żeby przyciski
+  // we wszystkich kolejkach zgadzały się z tym, co naprawdę słychać.
+  const [playingRequestId, setPlayingRequestId] = useState<number | null>(null);
 
   const refresh = useCallback(async () => {
     const [review, ready, history] = await Promise.all([
@@ -151,6 +164,42 @@ export function QueuesView() {
     };
   }, []);
 
+  // Odsłuch voice-overu. Zdarzenie przychodzi też wtedy, gdy klip sam się skończył — wtedy
+  // przycisk wraca do stanu „Odsłuchaj” bez pytania DJ-a o cokolwiek.
+  useEffect(() => {
+    const unlisten = listen<PlaybackStatus>(EVENT_PLAYBACK, (event) => {
+      setPlayingRequestId(event.payload.request_id);
+    });
+
+    return () => {
+      void unlisten.then((stop) => stop());
+    };
+  }, []);
+
+  /**
+   * Odsłuch dedykacji. Nie odświeżamy przy tym kolejek — odtwarzanie niczego w nich nie zmienia,
+   * więc nie ma po co przerysowywać całego ekranu w trakcie słuchania.
+   */
+  async function togglePlayback(request: QueuedRequest) {
+    setError(null);
+
+    const playing = playingRequestId === request.id;
+
+    try {
+      if (playing) {
+        await invoke("stop_dedication");
+      } else {
+        await invoke("play_dedication", { request_id: request.id });
+      }
+    } catch (reason: unknown) {
+      const prefix = playing
+        ? ui.queue.voiceOver.stopError
+        : ui.queue.voiceOver.playError;
+
+      setError(`${prefix} ${String(reason)}`);
+    }
+  }
+
   /**
    * Stan voice-overu karty. Bieżący przebieg generowania wygrywa ze ścieżką klipu, bo po poprawce
    * tekstu klip z bazy jest już nieaktualny, a nowy jeszcze się liczy.
@@ -217,6 +266,8 @@ export function QueuesView() {
                   disabled={busy}
                   voiceOver={voiceOverFor(request)}
                   ttsAvailable={ttsAvailable}
+                  playing={playingRequestId === request.id}
+                  onTogglePlayback={() => void togglePlayback(request)}
                   onGenerateVoiceOver={() =>
                     void run(
                       () => invoke("generate_clip", { request_id: request.id }),
@@ -275,6 +326,8 @@ export function QueuesView() {
                     disabled={busy}
                     voiceOver={voiceOverFor(request)}
                     ttsAvailable={ttsAvailable}
+                    playing={playingRequestId === request.id}
+                    onTogglePlayback={() => void togglePlayback(request)}
                     onGenerateVoiceOver={() =>
                       void run(
                         () => invoke("generate_clip", { request_id: request.id }),

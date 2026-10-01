@@ -4,7 +4,7 @@ import { motion } from "framer-motion";
 import { Check, Save } from "lucide-react";
 
 import { ui } from "../text";
-import type { AppSettings } from "../types";
+import type { AppSettings, OutputDevice } from "../types";
 
 /** Zakres czasu powrotu ekranu potwierdzenia — musi zgadzać się ze stałą w `settings.rs`. */
 const CONFIRMATION_SECONDS_RANGE = { min: 5, max: 300 } as const;
@@ -32,6 +32,12 @@ export function SettingsView() {
   const [port, setPort] = useState("");
   const [confirmationSeconds, setConfirmationSeconds] = useState("");
   const [values, setValues] = useState<Record<string, string>>({});
+  const [audioDeviceId, setAudioDeviceId] = useState("");
+  const [devices, setDevices] = useState<OutputDevice[]>([]);
+  // Czy lista urządzeń zdążyła się wczytać — dopiero wtedy umiemy powiedzieć, że zapisane
+  // urządzenie zniknęło, a nie tylko że lista jest jeszcze pusta.
+  const [devicesLoaded, setDevicesLoaded] = useState(false);
+  const [devicesError, setDevicesError] = useState<string | null>(null);
   // Cały wczytany zestaw trzymamy obok pól formularza: zapisywanie wysyła komplet ustawień,
   // a formularz nie edytuje jeszcze lektora — bez tego zapis kasowałby głos i jego strojenie.
   const [snapshot, setSnapshot] = useState<AppSettings | null>(null);
@@ -52,6 +58,7 @@ export function SettingsView() {
         setPin(settings.pin);
         setPort(String(settings.port));
         setConfirmationSeconds(String(settings.confirmation_seconds));
+        setAudioDeviceId(settings.audio.output_device_id);
         setValues({
           dedication_max_chars: String(settings.limits.dedication_max_chars),
           guest_name_max_chars: String(settings.limits.guest_name_max_chars),
@@ -61,6 +68,32 @@ export function SettingsView() {
       .catch((reason: unknown) => {
         if (active) {
           setError(`${ui.settings.loadError} ${String(reason)}`);
+        }
+      });
+
+    return () => {
+      active = false;
+    };
+  }, []);
+
+  // Lista urządzeń wyjściowych. Brak listy nie może zablokować ustawień — wtedy zostaje wybór
+  // domyślnego urządzenia systemowego.
+  useEffect(() => {
+    let active = true;
+
+    invoke<OutputDevice[]>("audio_devices")
+      .then((listed) => {
+        if (!active) {
+          return;
+        }
+
+        setDevices(listed);
+        setDevicesLoaded(true);
+      })
+      .catch((reason: unknown) => {
+        if (active) {
+          setDevicesError(`${ui.settings.audioDeviceError} ${String(reason)}`);
+          setDevicesLoaded(true);
         }
       });
 
@@ -124,6 +157,7 @@ export function SettingsView() {
           port: parsedPort,
           confirmation_seconds: parsedConfirmationSeconds,
           limits,
+          audio: { output_device_id: audioDeviceId },
         },
       });
       setSaved(true);
@@ -133,6 +167,14 @@ export function SettingsView() {
       setBusy(false);
     }
   }
+
+  // Zapisane urządzenie mogło zostać odłączone. Pokazujemy to wprost, zamiast po cichu
+  // przestawiać DJ-a na domyślne wyjście — na imprezie to różnica między dźwiękiem w sali
+  // a dźwiękiem w słuchawce.
+  const deviceMissing =
+    devicesLoaded &&
+    audioDeviceId !== "" &&
+    !devices.some((device) => device.id === audioDeviceId);
 
   return (
     <motion.form
@@ -195,6 +237,34 @@ export function SettingsView() {
           className="w-40 rounded border border-scena-700 bg-scena-950 px-3 py-2 text-zinc-100 outline-none focus:border-zinc-500"
         />
         <span className="text-xs text-zinc-500">{ui.settings.confirmationSecondsHint}</span>
+      </label>
+
+      <label className="flex flex-col gap-1">
+        <span className="text-xs font-medium text-zinc-300">{ui.settings.audioDeviceLabel}</span>
+        <select
+          value={audioDeviceId}
+          onChange={(event) => {
+            setAudioDeviceId(event.currentTarget.value);
+            setSaved(false);
+          }}
+          className="w-full max-w-lg rounded border border-scena-700 bg-scena-950 px-3 py-2 text-zinc-100 outline-none focus:border-zinc-500"
+        >
+          <option value="">{ui.settings.audioDeviceDefault}</option>
+
+          {deviceMissing && (
+            <option value={audioDeviceId}>{ui.settings.audioDeviceMissing}</option>
+          )}
+
+          {devices.map((device) => (
+            <option key={device.id} value={device.id}>
+              {device.is_default
+                ? `${device.name} — ${ui.settings.audioDeviceDefaultTag}`
+                : device.name}
+            </option>
+          ))}
+        </select>
+        <span className="text-xs text-zinc-500">{ui.settings.audioDeviceHint}</span>
+        {devicesError !== null && <span className="text-xs text-red-400">{devicesError}</span>}
       </label>
 
       <div className="grid grid-cols-3 gap-4">

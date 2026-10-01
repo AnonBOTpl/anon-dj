@@ -68,6 +68,12 @@ export type TtsSettings = {
   tuning: VoiceTuning;
 };
 
+/** Ustawienia dźwięku — zgadzają się z typem `AudioSettings` w `src-tauri/src/settings.rs`. */
+export type AudioSettings = {
+  /** Identyfikator urządzenia wyjściowego; pusty oznacza domyślne urządzenie systemowe. */
+  output_device_id: string;
+};
+
 /** Ustawienia DJ-a — zgadzają się z typem `AppSettings` w `src-tauri/src/settings.rs`. */
 export type AppSettings = {
   pin: string;
@@ -75,4 +81,21 @@ export type AppSettings = {
   confirmation_seconds: number;
   limits: Limits;
   tts: TtsSettings;
+  audio: AudioSettings;
+};
+
+/** Urządzenie wyjściowe dźwięku — zgadza się z `OutputDevice` w `src-tauri/src/audio.rs`. */
+export type OutputDevice = {
+  /** Identyfikator urządzenia; to zapisujemy w ustawieniach. */
+  id: string;
+  /** Czytelna nazwa pokazywana DJ-owi. */
+  name: string;
+  /** Czy to domyślne urządzenie systemowe. */
+  is_default: boolean;
+};
+
+/** Stan odtwarzania voice-overu — zgadza się z `PlaybackStatus` w `src-tauri/src/audio.rs`. */
+export type PlaybackStatus = {
+  /** Prośba, której voice-overu słuchamy; `null`, gdy nic nie leci. */
+  request_id: number | null;
 };

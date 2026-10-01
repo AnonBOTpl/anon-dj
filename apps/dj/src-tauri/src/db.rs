@@ -514,6 +514,22 @@ impl Db {
         Ok(())
     }
 
+    /// Ścieżka gotowego klipu lektora. `None` oznacza brak klipu **albo** brak prośby —
+    /// odtwarzacz i tak nie ma czego puścić, więc nie ma po co ich rozróżniać.
+    pub fn tts_clip_path(&self, id: i64) -> Result<Option<String>, DbError> {
+        let conn = self.lock()?;
+
+        let path = conn
+            .query_row(
+                "SELECT tts_clip_path FROM requests WHERE id = ?1",
+                params![id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?;
+
+        Ok(path.flatten())
+    }
+
     /// Przesuwa prośbę w kolejce gotowych o jedno miejsce. `false` oznacza, że nie ma dokąd —
     /// prośba stoi już na początku albo na końcu.
     pub fn move_request(&self, id: i64, up: bool) -> Result<bool, DbError> {
@@ -1420,6 +1436,10 @@ mod tests {
             db.ready_requests(10).expect("kolejka")[0].tts_clip_path,
             Some("C:\\klipy\\abc.wav".to_string())
         );
+        assert_eq!(
+            db.tts_clip_path(request).expect("odczyt ścieżki"),
+            Some("C:\\klipy\\abc.wav".to_string())
+        );
 
         // Poprawka dedykacji unieważnia klip — musi dać się wyczyścić.
         db.set_tts_clip_path(request, None)
@@ -1429,6 +1449,13 @@ mod tests {
             db.ready_requests(10).expect("kolejka")[0].tts_clip_path,
             None
         );
+
+        assert_eq!(
+            db.tts_clip_path(request).expect("odczyt ścieżki"),
+            None,
+            "po wyczyszczeniu nie ma czego odtwarzać"
+        );
+        assert_eq!(db.tts_clip_path(999).expect("brak prośby"), None);
     }
 
     #[test]
