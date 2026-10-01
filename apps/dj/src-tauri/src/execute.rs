@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 use tauri::AppHandle;
 use tracing::{info, warn};
 
-use crate::audio::{AudioError, PlaybackTarget, VoiceOverPlayer};
+use crate::audio::{AudioError, PlaybackSlot, PlaybackTarget, VoiceOverPlayer};
 use crate::player::{PlaybackState, PlayerAdapter, PlayerError, PlayerStatus};
 use crate::settings::ExecutionSettings;
 use crate::volume::{self, RampStep, SILENCE_DB};
@@ -61,7 +61,7 @@ pub struct ExecutionPlan {
     pub track_path: String,
     /// Ścieżka gotowego klipu lektora.
     pub clip_path: PathBuf,
-    /// Urządzenie wyjściowe voice-overu (puste = domyślne systemowe).
+    /// Urządzenie wyjściowe voice-overu na antenie (puste = domyślne systemowe).
     pub device_id: String,
     /// Głośność lektora jako mnożnik.
     pub tts_volume: f32,
@@ -184,9 +184,10 @@ pub fn run_sequence(
         apply_ramp(adapter, &plan_ramp, &mut sleep)?;
     }
 
-    // 3. Dedykacja.
+    // 3. Dedykacja — gniazdo anteny, żeby odsłuch DJ-a jej nie uciążał ani nie gasił.
     clips.play(
         app,
+        PlaybackSlot::OnAir,
         PlaybackTarget::Request(plan.request_id),
         &plan.clip_path,
         &plan.device_id,
@@ -194,7 +195,7 @@ pub fn run_sequence(
     )?;
 
     // 4. Czekamy na jej koniec.
-    let mut current = || clips.current();
+    let mut current = || clips.on_air_target();
     let target = PlaybackTarget::Request(plan.request_id);
 
     if !wait_for_clip(&mut current, target, &mut sleep) {

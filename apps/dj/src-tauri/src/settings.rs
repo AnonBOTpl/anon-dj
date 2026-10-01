@@ -37,9 +37,11 @@ pub const KEY_TTS_NOISE_W: &str = "tts.noise_w";
 pub const KEY_TTS_VOLUME: &str = "tts.volume";
 /// Klucz ustawienia z pauzą między zdaniami lektora.
 pub const KEY_TTS_SENTENCE_SILENCE: &str = "tts.sentence_silence_ms";
-/// Klucz ustawienia z urządzeniem wyjściowym voice-overu. Trzymamy **identyfikator**
+/// Klucz ustawienia z urządzeniem wyjściowym voice-overu na antenie. Trzymamy **identyfikator**
 /// urządzenia, bo przeżywa restart systemu i ponowne podłączenie karty.
 pub const KEY_AUDIO_OUTPUT_DEVICE: &str = "audio.output_device_id";
+/// Klucz ustawienia z urządzeniem odsłuchu DJ-a. Puste znaczy „to samo co wyjście na antenę”.
+pub const KEY_AUDIO_PREVIEW_DEVICE: &str = "audio.preview_device_id";
 /// Klucz ustawienia z adresem API odtwarzacza (beefweb w foobar2000).
 pub const KEY_PLAYER_BASE_URL: &str = "player.base_url";
 /// Klucz ustawienia z poziomem ściszenia muzyki pod lektorem (procent amplitudy).
@@ -189,11 +191,34 @@ impl Default for TtsSettings {
 }
 
 /// Ustawienia dźwięku: gdzie ma wyjść voice-over.
+///
+/// Rozdzielamy dwa wyjścia: **antenę** (to, co słyszy sala razem z muzyką) i **odsłuch DJ-a**
+/// (sprawdzenie dedykacji przed zatwierdzeniem). Dzięki temu DJ może odsłuchać voice-over na
+/// słuchawkach, nie puszczając go na salę i nie przerywając sekwencji, która właśnie gra.
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct AudioSettings {
-    /// Identyfikator urządzenia wyjściowego. **Pusty oznacza domyślne urządzenie systemowe** —
-    /// i tak startuje świeża instalacja, żeby aplikacja działała bez zaglądania do ustawień.
+    /// Identyfikator urządzenia wyjściowego na antenie. **Pusty oznacza domyślne urządzenie
+    /// systemowe** — i tak startuje świeża instalacja, żeby aplikacja działała bez zaglądania
+    /// do ustawień.
     pub output_device_id: String,
+    /// Identyfikator urządzenia odsłuchu DJ-a. **Pusty oznacza „to samo co na antenie”** — dzięki
+    /// temu starszy interfejs i świeża instalacja zachowują się jak dotąd.
+    #[serde(default)]
+    pub preview_device_id: String,
+}
+
+impl AudioSettings {
+    /// Urządzenie, na którym DJ odsłuchuje voice-over: osobne, jeśli wybrane, a w przeciwnym
+    /// razie wyjście na antenę.
+    pub fn audition_device_id(&self) -> &str {
+        let preview = self.preview_device_id.trim();
+
+        if preview.is_empty() {
+            self.output_device_id.trim()
+        } else {
+            preview
+        }
+    }
 }
 
 /// Ustawienia odtwarzacza: gdzie stoi API beefweb.
@@ -324,6 +349,9 @@ impl AppSettings {
                 output_device_id: db
                     .setting(KEY_AUDIO_OUTPUT_DEVICE)?
                     .unwrap_or(defaults.audio.output_device_id),
+                preview_device_id: db
+                    .setting(KEY_AUDIO_PREVIEW_DEVICE)?
+                    .unwrap_or(defaults.audio.preview_device_id),
             },
             player: PlayerSettings {
                 base_url: db
@@ -388,6 +416,7 @@ impl AppSettings {
         )?;
 
         db.set_setting(KEY_AUDIO_OUTPUT_DEVICE, &self.audio.output_device_id)?;
+        db.set_setting(KEY_AUDIO_PREVIEW_DEVICE, &self.audio.preview_device_id)?;
         db.set_setting(KEY_PLAYER_BASE_URL, self.player.base_url.trim())?;
 
         db.set_setting(
@@ -443,6 +472,7 @@ impl AppSettings {
         validate_tts(&self.tts.voice, &self.tts.tuning)?;
 
         check_audio_device(&self.audio.output_device_id)?;
+        check_audio_device(&self.audio.preview_device_id)?;
 
         check_player_url(&self.player.base_url)?;
 
@@ -656,6 +686,7 @@ mod tests {
             },
             audio: AudioSettings {
                 output_device_id: "wasapi:Głośniki (Realtek Audio)".to_string(),
+                preview_device_id: "wasapi:Słuchawki".to_string(),
             },
             player: PlayerSettings {
                 base_url: "http://localhost:8880".to_string(),
@@ -734,6 +765,10 @@ mod tests {
 
         assert!(settings.validate().is_ok());
         assert_eq!(settings.audio.output_device_id, "");
+        assert_eq!(
+            settings.audio.preview_device_id, "",
+            "świeża instalacja odsłuchuje na tym samym wyjściu co antena"
+        );
     }
 
     #[test]
@@ -758,10 +793,32 @@ mod tests {
     }
 
     #[test]
+    fn an_older_interface_without_the_audition_field_keeps_the_on_air_output() {
+        let settings: AppSettings = serde_json::from_str(
+            r#"{
+                "pin": "123456",
+                "port": 8790,
+                "confirmation_seconds": 20,
+                "limits": {
+                    "dedication_max_chars": 400,
+                    "guest_name_max_chars": 40,
+                    "search_query_max_chars": 80
+                },
+                "audio": { "output_device_id": "wasapi:Głośniki" }
+            }"#,
+        )
+        .expect("starszy interfejs bez pola odsłuchu");
+
+        assert_eq!(settings.audio.preview_device_id, "");
+        assert_eq!(settings.audio.audition_device_id(), "wasapi:Głośniki");
+    }
+
+    #[test]
     fn an_absurdly_long_device_name_is_rejected() {
         let settings = AppSettings {
             audio: AudioSettings {
                 output_device_id: "x".repeat(AUDIO_DEVICE_MAX_CHARS + 1),
+                ..AudioSettings::default()
             },
             ..AppSettings::default()
         };
@@ -770,6 +827,44 @@ mod tests {
             settings.validate(),
             Err(SettingsError::InvalidAudioDevice)
         ));
+
+        let settings = AppSettings {
+            audio: AudioSettings {
+                preview_device_id: "x".repeat(AUDIO_DEVICE_MAX_CHARS + 1),
+                ..AudioSettings::default()
+            },
+            ..AppSettings::default()
+        };
+
+        assert!(matches!(
+            settings.validate(),
+            Err(SettingsError::InvalidAudioDevice)
+        ));
+    }
+
+    #[test]
+    fn the_audition_falls_back_to_the_on_air_output() {
+        let mut audio = AudioSettings::default();
+
+        assert_eq!(
+            audio.audition_device_id(),
+            "",
+            "domyślnie oba wyjścia są systemowe"
+        );
+
+        audio.output_device_id = "wasapi:Głośniki".to_string();
+        assert_eq!(
+            audio.audition_device_id(),
+            "wasapi:Głośniki",
+            "bez osobnego odsłuchu słyszymy to samo co sala"
+        );
+
+        audio.preview_device_id = "  wasapi:Słuchawki  ".to_string();
+        assert_eq!(
+            audio.audition_device_id(),
+            "wasapi:Słuchawki",
+            "osobny odsłuch wygrywa z anteną"
+        );
     }
 
     #[test]

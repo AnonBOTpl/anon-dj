@@ -75,7 +75,7 @@ struct AppState {
     tts: Mutex<piper::TtsRuntime>,
     /// Zlecenia generowania klipów lektora w tle wraz z postępem dla interfejsu.
     clips: Arc<clips::ClipJobs>,
-    /// Odsłuch voice-overu na wybranym urządzeniu wyjściowym.
+    /// Odtwarzanie voice-overu: osobne gniazda na antenę i na odsłuch DJ-a.
     audio: Arc<audio::VoiceOverPlayer>,
 }
 
@@ -186,10 +186,12 @@ async fn audio_devices() -> Result<Vec<audio::OutputDevice>, String> {
         .map_err(|error| error.to_string())
 }
 
-/// Odsłuchuje gotowy voice-over prośby na urządzeniu wyjściowym z ustawień.
+/// Odsłuchuje gotowy voice-over prośby na urządzeniu **odsłuchu DJ-a** z ustawień.
 ///
 /// To przycisk „Odsłuchaj” z PLAN.md (sekcja 8): DJ sprawdza dedykację i brzmienie głosu, zanim
 /// puści ją na antenę. Klipu nie liczymy na nowo — bierzemy gotowy plik i tylko go odtwarzamy.
+/// Odsłuch idzie osobnym gniazdem i (jeśli DJ je wskaże) osobnym urządzeniem, żeby nie uciąć
+/// dedykacji lecącej właśnie na antenie ani nie kończyć przedwcześnie sekwencji wykonania.
 #[tauri::command(rename_all = "snake_case")]
 async fn play_dedication(
     app: tauri::AppHandle,
@@ -210,7 +212,7 @@ async fn play_dedication(
             .map_err(|_| SETTINGS_UNAVAILABLE.to_string())?;
 
         (
-            settings.audio.output_device_id.clone(),
+            settings.audio.audition_device_id().to_string(),
             audio::playback_volume(settings.tts.tuning.volume_percent),
         )
     };
@@ -222,6 +224,7 @@ async fn play_dedication(
     tauri::async_runtime::spawn_blocking(move || {
         player.play(
             &handle,
+            audio::PlaybackSlot::Audition,
             audio::PlaybackTarget::Request(request_id),
             Path::new(&path),
             &device,
@@ -262,7 +265,7 @@ async fn preview_voice(
             .map_err(|_| SETTINGS_UNAVAILABLE.to_string())?;
 
         (
-            settings.audio.output_device_id.clone(),
+            settings.audio.audition_device_id().to_string(),
             settings.limits.dedication_max_chars as usize,
         )
     };
@@ -297,6 +300,7 @@ async fn preview_voice(
         player
             .play(
                 &handle,
+                audio::PlaybackSlot::Audition,
                 audio::PlaybackTarget::Preview,
                 &clip.path,
                 &device,
@@ -313,7 +317,7 @@ async fn preview_voice(
     .map_err(|error| error.to_string())?
 }
 
-/// Zatrzymuje odsłuch voice-overu.
+/// Zatrzymuje odsłuch voice-overu. Antena zostaje nietknięta.
 #[tauri::command]
 async fn stop_dedication(
     app: tauri::AppHandle,
@@ -322,7 +326,7 @@ async fn stop_dedication(
     let player = Arc::clone(&state.audio);
     let handle = app.clone();
 
-    tauri::async_runtime::spawn_blocking(move || player.stop(&handle))
+    tauri::async_runtime::spawn_blocking(move || player.stop_audition(&handle))
         .await
         .map_err(|error| error.to_string())
 }

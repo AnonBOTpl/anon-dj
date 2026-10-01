@@ -70,8 +70,33 @@ export type TtsSettings = {
 
 /** Ustawienia dźwięku — zgadzają się z typem `AudioSettings` w `src-tauri/src/settings.rs`. */
 export type AudioSettings = {
-  /** Identyfikator urządzenia wyjściowego; pusty oznacza domyślne urządzenie systemowe. */
+  /** Identyfikator urządzenia wyjściowego na antenie; pusty oznacza domyślne urządzenie systemowe. */
   output_device_id: string;
+  /** Identyfikator urządzenia odsłuchu DJ-a; pusty oznacza „to samo co na antenie”. */
+  preview_device_id: string;
+};
+
+/** Ustawienia odtwarzacza — zgadzają się z typem `PlayerSettings` w `src-tauri/src/settings.rs`. */
+export type PlayerSettings = {
+  /** Bazowy adres API beefweb, np. `http://localhost:8880`. */
+  base_url: string;
+};
+
+/**
+ * Strojenie sekwencji wykonania — zgadza się z typem `ExecutionSettings`
+ * w `src-tauri/src/settings.rs`. Wszystkie czasy w milisekundach.
+ */
+export type ExecutionSettings = {
+  /** Poziom ducku w procentach amplitudy (0 = cisza, 100 = brak ściszenia). */
+  duck_percent: number;
+  /** Jak długo ściszamy do poziomu ducku. */
+  duck_ramp_ms: number;
+  /** Pauza po dedykacji, zanim zaczniemy wyciszać stary utwór. */
+  gap_ms: number;
+  /** Jak długo wyciszamy stary utwór. */
+  fade_out_ms: number;
+  /** Jak długo zamówiony utwór wjeżdża do normalnej głośności. */
+  start_ramp_ms: number;
 };
 
 /** Ustawienia DJ-a — zgadzają się z typem `AppSettings` w `src-tauri/src/settings.rs`. */
@@ -82,6 +107,8 @@ export type AppSettings = {
   limits: Limits;
   tts: TtsSettings;
   audio: AudioSettings;
+  player: PlayerSettings;
+  execute: ExecutionSettings;
 };
 
 /** Urządzenie wyjściowe dźwięku — zgadza się z `OutputDevice` w `src-tauri/src/audio.rs`. */

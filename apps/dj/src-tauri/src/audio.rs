@@ -1,8 +1,9 @@
 //! Odtwarzanie klipu lektora na wybranym urządzeniu wyjściowym (PLAN.md, sekcja 8).
 //!
-//! DJ musi usłyszeć dedykację, zanim puści ją na antenę, i musi ona wyjść **tym samym wyjściem,
-//! co muzyka** — inaczej gość usłyszy lektora z innych głośników niż utwór. Dlatego urządzenie
-//! wyjściowe jest ustawieniem, a nie czymś, co wybiera system.
+//! Voice-over na antenie musi wyjść **tym samym wyjściem, co muzyka** — inaczej gość usłyszy
+//! lektora z innych głośników niż utwór. Odsłuch DJ-a to inna sprawa: to sprawdzenie dedykacji
+//! przed zatwierdzeniem, więc może iść na osobne urządzenie, np. słuchawki, i nie musi trafiać
+//! na salę. Dlatego oba wyjścia są ustawieniami, a nie czymś, co wybiera system.
 //!
 //! Sam dźwięk to cienka warstwa nad `rodio`: otwarcie strumienia i podanie pliku WAV. Logikę,
 //! którą da się sprawdzić bez sprzętu (głośność, nazwa urządzenia), trzymamy osobno i testujemy.
@@ -10,8 +11,9 @@
 //! Zapamiętujemy **identyfikator** urządzenia, a nie jego nazwę: identyfikator przeżywa restart
 //! systemu i ponowne podłączenie karty, więc wybór DJ-a nie przepada po restarcie imprezy.
 //!
-//! Odtwarzamy zawsze jedną rzecz naraz — kolejna prośba milknie poprzednią. Kiedy klip się kończy,
-//! watcher zwalnia strumień i wysyła zdarzenie, po którym interfejs gasi przycisk.
+//! W każdym gnieździe odtwarzamy jedną rzecz naraz — kolejny klip milknie poprzedni w **tym**
+//! gnieździe, ale antena i odsłuch nie wyciszają się nawzajem. Kiedy klip się kończy, watcher
+//! zwalnia strumień i (dla odsłuchu) wysyła zdarzenie, po którym interfejs gasi przycisk.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -65,6 +67,19 @@ pub struct OutputDevice {
     pub name: String,
     /// Czy to domyślne urządzenie systemowe.
     pub is_default: bool,
+}
+
+/// Do którego wyjścia trafia voice-over.
+///
+/// Rozdzielenie jest istotne: odsłuch DJ-a (przyciski „Odsłuchaj”) nie może uciąć dedykacji
+/// lecącej właśnie na antenie ani przedwcześnie zakończyć sekwencji wykonania — a do tego
+/// wystarczyłoby, żeby oba odtwarzania dzieliły jedno gniazdo.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlaybackSlot {
+    /// Voice-over na antenie, prowadzony przez sekwencję wykonania.
+    OnAir,
+    /// Odsłuch DJ-a — dedykacja przed zatwierdzeniem albo próbka głosu.
+    Audition,
 }
 
 /// Co odtwarzamy — voice-over prośby z kolejki albo próbkę głosu z ekranu lektora.
@@ -175,9 +190,13 @@ struct Active {
     player: Arc<Player>,
 }
 
-/// Odtwarzacz voice-overu. Trzyma najwyżej jedno odtwarzanie naraz.
+/// Odtwarzacz voice-overu. Antena i odsłuch DJ-a to dwa **niezależne** gniazda: każde trzyma
+/// najwyżej jedno odtwarzanie naraz, ale jedno nie wycisza drugiego.
 pub struct VoiceOverPlayer {
-    active: Mutex<Option<Active>>,
+    /// Voice-over na antenie. Sekwencja wykonania czeka właśnie na jego koniec.
+    on_air: Mutex<Option<Active>>,
+    /// Odsłuch DJ-a. Nie miesza się z anteną.
+    audition: Mutex<Option<Active>>,
     serial: AtomicU64,
 }
 
@@ -190,15 +209,18 @@ impl Default for VoiceOverPlayer {
 impl VoiceOverPlayer {
     pub fn new() -> Self {
         Self {
-            active: Mutex::new(None),
+            on_air: Mutex::new(None),
+            audition: Mutex::new(None),
             serial: AtomicU64::new(0),
         }
     }
 
-    /// Odtwarza klip na wskazanym urządzeniu. Poprzednie odtwarzanie milknie.
+    /// Odtwarza klip na wskazanym urządzeniu, w wybranym gnieździe. Poprzednie odtwarzanie
+    /// **w tym samym gnieździe** milknie; drugie gniazdo zostaje nietknięte.
     pub fn play(
         self: &Arc<Self>,
         app: &AppHandle,
+        slot: PlaybackSlot,
         target: PlaybackTarget,
         path: &Path,
         device_id: &str,
@@ -221,8 +243,8 @@ impl VoiceOverPlayer {
 
         let serial = self.serial.fetch_add(1, Ordering::SeqCst) + 1;
 
-        // Podmiana odtwarzania: stare strumienie (razem ze swoim klipem) milkną tutaj.
-        match self.active.lock() {
+        // Podmiana odtwarzania: stare strumienie w tym samym gnieździe milkną tutaj.
+        match self.slot(slot).lock() {
             Ok(mut active) => {
                 *active = Some(Active {
                     serial,
@@ -237,28 +259,36 @@ impl VoiceOverPlayer {
         info!(
             request_id = target.request_id(),
             preview = matches!(target, PlaybackTarget::Preview),
+            on_air = matches!(slot, PlaybackSlot::OnAir),
             "odtwarzam voice-over"
         );
-        emit_playback(app, PlaybackStatus::playing(target));
-        self.watch(app.clone(), serial, player);
+
+        // Interfejs pokazuje przyciski „Odsłuchaj” tylko dla odsłuchu — voice-over na antenie
+        // ma swój wskaźnik przy prośbie, więc nie zaśmiecamy nim stanu odsłuchu.
+        if matches!(slot, PlaybackSlot::Audition) {
+            emit_playback(app, PlaybackStatus::playing(target));
+        }
+
+        self.watch(app.clone(), slot, serial, player);
 
         Ok(())
     }
 
-    /// Co leci w tej chwili; `None` oznacza ciszę.
+    /// Co leci **na antenie**; `None` oznacza ciszę.
     ///
-    /// Sekwencja wykonania czeka na koniec dedykacji, pytając właśnie o to — stan jest ustawiany
-    /// od razu w [`VoiceOverPlayer::play`] i czyszczony, gdy klip dobiegnie końca.
-    pub fn current(&self) -> Option<PlaybackTarget> {
-        match self.active.lock() {
+    /// Sekwencja wykonania czeka na koniec dedykacji, pytając właśnie o to. Odsłuch DJ-a nie ma
+    /// na to wpływu — może lecieć w słuchawkach, a sekwencja i tak wie, że na antenie wciąż mówi
+    /// lektor.
+    pub fn on_air_target(&self) -> Option<PlaybackTarget> {
+        match self.on_air.lock() {
             Ok(active) => active.as_ref().map(|current| current.target),
             Err(_) => None,
         }
     }
 
-    /// Zatrzymuje odtwarzanie (jeśli coś leci).
-    pub fn stop(&self, app: &AppHandle) {
-        let stopped = match self.active.lock() {
+    /// Zatrzymuje odsłuch DJ-a, jeśli coś leci. Antena zostaje nietknięta.
+    pub fn stop_audition(&self, app: &AppHandle) {
+        let stopped = match self.audition.lock() {
             Ok(mut active) => active.take(),
             Err(_) => None,
         };
@@ -267,13 +297,27 @@ impl VoiceOverPlayer {
             // Opróżniamy kolejkę jawnie, żeby watcher nie czekał na klatki po wyciszeniu.
             active.player.stop();
 
-            info!("voice-over zatrzymany");
+            info!("odsłuch voice-overu zatrzymany");
             emit_playback(app, PlaybackStatus::stopped());
         }
     }
 
+    /// Gniazdo wybrane przez `slot`.
+    fn slot(&self, slot: PlaybackSlot) -> &Mutex<Option<Active>> {
+        match slot {
+            PlaybackSlot::OnAir => &self.on_air,
+            PlaybackSlot::Audition => &self.audition,
+        }
+    }
+
     /// Czeka, aż klip dobiegnie końca, i wtedy zwalnia strumień.
-    fn watch(self: &Arc<Self>, app: AppHandle, serial: u64, player: Arc<Player>) {
+    fn watch(
+        self: &Arc<Self>,
+        app: AppHandle,
+        slot: PlaybackSlot,
+        serial: u64,
+        player: Arc<Player>,
+    ) {
         // Referencja do odtwarzacza nie może wyjść poza metodę, więc watcher dostaje własny `Arc`.
         let jobs = Arc::clone(self);
 
@@ -287,15 +331,16 @@ impl VoiceOverPlayer {
             }
 
             // Ktoś mógł w międzyczasie puścić coś nowszego — wtedy nie wygaszamy interfejsu.
-            if jobs.finish(serial) {
+            if jobs.finish(slot, serial) && matches!(slot, PlaybackSlot::Audition) {
                 emit_playback(&app, PlaybackStatus::stopped());
             }
         });
     }
 
-    /// Zwalnia odtwarzanie o podanym numerze. `false` oznacza, że to już nieaktualne odtwarzanie.
-    fn finish(&self, serial: u64) -> bool {
-        match self.active.lock() {
+    /// Zwalnia odtwarzanie o podanym numerze w danym gnieździe. `false` oznacza, że to już
+    /// nieaktualne odtwarzanie.
+    fn finish(&self, slot: PlaybackSlot, serial: u64) -> bool {
+        match self.slot(slot).lock() {
             Ok(mut active) => {
                 let is_current = active.as_ref().map(|current| current.serial) == Some(serial);
 
@@ -405,7 +450,7 @@ mod tests {
     fn nothing_is_playing_before_anything_starts() {
         let player = VoiceOverPlayer::new();
 
-        assert_eq!(player.current(), None);
+        assert_eq!(player.on_air_target(), None);
     }
 
     #[test]
@@ -413,11 +458,15 @@ mod tests {
         let player = VoiceOverPlayer::new();
 
         assert!(
-            !player.finish(1),
+            !player.finish(PlaybackSlot::OnAir, 1),
             "bez uruchomionego odtwarzania nie ma czego zwalniać"
         );
         assert!(
-            !player.finish(2),
+            !player.finish(PlaybackSlot::Audition, 1),
+            "odsłuch też nie ma czego zwalniać"
+        );
+        assert!(
+            !player.finish(PlaybackSlot::OnAir, 2),
             "nieaktualny numer odtwarzania nie może nic zwolnić"
         );
     }

@@ -4,10 +4,58 @@ import { motion } from "framer-motion";
 import { Save, X } from "lucide-react";
 
 import { ui } from "../text";
-import type { AppSettings, OutputDevice } from "../types";
+import type { AppSettings, ExecutionSettings, OutputDevice } from "../types";
 
 /** Zakres czasu powrotu ekranu potwierdzenia — musi zgadzać się ze stałą w `settings.rs`. */
 const CONFIRMATION_SECONDS_RANGE = { min: 5, max: 300 } as const;
+
+/**
+ * Pola strojenia sekwencji wykonania. Zakresy muszą zgadzać się ze stałymi w `settings.rs`
+ * (`DUCK_PERCENT_RANGE` i `EXECUTE_MS_RANGE`) — poza nimi Rust odrzuci zapis.
+ */
+const sequenceFields: {
+  key: keyof ExecutionSettings;
+  label: string;
+  hint: string;
+  min: number;
+  max: number;
+}[] = [
+  {
+    key: "duck_percent",
+    label: ui.settings.duckLevelLabel,
+    hint: ui.settings.duckLevelHint,
+    min: 0,
+    max: 100,
+  },
+  {
+    key: "duck_ramp_ms",
+    label: ui.settings.duckRampLabel,
+    hint: ui.settings.duckRampHint,
+    min: 0,
+    max: 5000,
+  },
+  {
+    key: "gap_ms",
+    label: ui.settings.gapLabel,
+    hint: ui.settings.gapHint,
+    min: 0,
+    max: 5000,
+  },
+  {
+    key: "fade_out_ms",
+    label: ui.settings.fadeOutLabel,
+    hint: ui.settings.fadeOutHint,
+    min: 0,
+    max: 5000,
+  },
+  {
+    key: "start_ramp_ms",
+    label: ui.settings.startRampLabel,
+    hint: ui.settings.startRampHint,
+    min: 0,
+    max: 5000,
+  },
+];
 
 const numberFields = [
   {
@@ -45,6 +93,8 @@ export function SettingsDialog({ onClose }: { onClose: () => void }) {
   const [confirmationSeconds, setConfirmationSeconds] = useState("");
   const [values, setValues] = useState<Record<string, string>>({});
   const [audioDeviceId, setAudioDeviceId] = useState("");
+  const [previewDeviceId, setPreviewDeviceId] = useState("");
+  const [executeValues, setExecuteValues] = useState<Record<string, string>>({});
   const [devices, setDevices] = useState<OutputDevice[]>([]);
   // Czy lista urządzeń zdążyła się wczytać — dopiero wtedy umiemy powiedzieć, że zapisane
   // urządzenie zniknęło, a nie tylko że lista jest jeszcze pusta.
@@ -70,11 +120,17 @@ export function SettingsDialog({ onClose }: { onClose: () => void }) {
         setPort(String(settings.port));
         setConfirmationSeconds(String(settings.confirmation_seconds));
         setAudioDeviceId(settings.audio.output_device_id);
+        setPreviewDeviceId(settings.audio.preview_device_id);
         setValues({
           dedication_max_chars: String(settings.limits.dedication_max_chars),
           guest_name_max_chars: String(settings.limits.guest_name_max_chars),
           search_query_max_chars: String(settings.limits.search_query_max_chars),
         });
+        setExecuteValues(
+          Object.fromEntries(
+            sequenceFields.map((field) => [field.key, String(settings.execute[field.key])]),
+          ),
+        );
       })
       .catch((reason: unknown) => {
         if (active) {
@@ -172,6 +228,28 @@ export function SettingsDialog({ onClose }: { onClose: () => void }) {
       return;
     }
 
+    // Strojenie sekwencji walidujemy tymi samymi zakresami, co Rust — komunikat jest wtedy
+    // konkretny („podaj liczbę z zakresu przy polu X”), a nie ogólny błąd z warstwy Rust.
+    const parsedExecute: ExecutionSettings = {
+      duck_percent: 0,
+      duck_ramp_ms: 0,
+      gap_ms: 0,
+      fade_out_ms: 0,
+      start_ramp_ms: 0,
+    };
+
+    for (const field of sequenceFields) {
+      const value = Number(executeValues[field.key]);
+
+      if (!Number.isInteger(value) || value < field.min || value > field.max) {
+        setError(`${ui.settings.sequenceNumberError} (${field.label})`);
+
+        return;
+      }
+
+      parsedExecute[field.key] = value;
+    }
+
     setBusy(true);
 
     try {
@@ -182,7 +260,8 @@ export function SettingsDialog({ onClose }: { onClose: () => void }) {
           port: parsedPort,
           confirmation_seconds: parsedConfirmationSeconds,
           limits,
-          audio: { output_device_id: audioDeviceId },
+          audio: { output_device_id: audioDeviceId, preview_device_id: previewDeviceId },
+          execute: parsedExecute,
         },
       });
 
@@ -202,6 +281,10 @@ export function SettingsDialog({ onClose }: { onClose: () => void }) {
   // a dźwiękiem w słuchawce.
   const deviceMissing =
     devicesLoaded && audioDeviceId !== "" && !devices.some((device) => device.id === audioDeviceId);
+  const auditionDeviceMissing =
+    devicesLoaded &&
+    previewDeviceId !== "" &&
+    !devices.some((device) => device.id === previewDeviceId);
 
   return (
     <div
@@ -302,12 +385,13 @@ export function SettingsDialog({ onClose }: { onClose: () => void }) {
                   type="number"
                   min={0}
                   value={values[field.key] ?? ""}
-                  onChange={(event) =>
-                    setValues((current) => ({
-                      ...current,
-                      [field.key]: event.currentTarget.value,
-                    }))
-                  }
+                  onChange={(event) => {
+                    // Wartość czytamy **przed** updaterem: React woła funkcję aktualizującą
+                    // po zakończeniu obsługi zdarzenia, kiedy `currentTarget` jest już `null`.
+                    const next = event.currentTarget.value;
+
+                    setValues((current) => ({ ...current, [field.key]: next }));
+                  }}
                   className={`w-40 ${input}`}
                 />
                 {field.hint !== null && <span className="text-xs text-zinc-500">{field.hint}</span>}
@@ -320,32 +404,93 @@ export function SettingsDialog({ onClose }: { onClose: () => void }) {
               {ui.settings.audioTitle}
             </h3>
 
-            <label className="flex flex-col gap-1">
-              <span className="text-xs font-medium text-zinc-300">
-                {ui.settings.audioDeviceLabel}
-              </span>
-              <select
-                value={audioDeviceId}
-                onChange={(event) => setAudioDeviceId(event.currentTarget.value)}
-                className={`w-full ${input}`}
-              >
-                <option value="">{ui.settings.audioDeviceDefault}</option>
+            <div className="grid grid-cols-2 gap-x-6 gap-y-4">
+              <label className="flex flex-col gap-1">
+                <span className="text-xs font-medium text-zinc-300">
+                  {ui.settings.audioDeviceLabel}
+                </span>
+                <select
+                  value={audioDeviceId}
+                  onChange={(event) => setAudioDeviceId(event.currentTarget.value)}
+                  className={`w-full ${input}`}
+                >
+                  <option value="">{ui.settings.audioDeviceDefault}</option>
 
-                {deviceMissing && (
-                  <option value={audioDeviceId}>{ui.settings.audioDeviceMissing}</option>
+                  {deviceMissing && (
+                    <option value={audioDeviceId}>{ui.settings.audioDeviceMissing}</option>
+                  )}
+
+                  {devices.map((device) => (
+                    <option key={device.id} value={device.id}>
+                      {device.is_default
+                        ? `${device.name} — ${ui.settings.audioDeviceDefaultTag}`
+                        : device.name}
+                    </option>
+                  ))}
+                </select>
+                <span className="text-xs text-zinc-500">{ui.settings.audioDeviceHint}</span>
+                {devicesError !== null && (
+                  <span className="text-xs text-red-400">{devicesError}</span>
                 )}
+              </label>
 
-                {devices.map((device) => (
-                  <option key={device.id} value={device.id}>
-                    {device.is_default
-                      ? `${device.name} — ${ui.settings.audioDeviceDefaultTag}`
-                      : device.name}
-                  </option>
-                ))}
-              </select>
-              <span className="text-xs text-zinc-500">{ui.settings.audioDeviceHint}</span>
-              {devicesError !== null && <span className="text-xs text-red-400">{devicesError}</span>}
-            </label>
+              <label className="flex flex-col gap-1">
+                <span className="text-xs font-medium text-zinc-300">
+                  {ui.settings.auditionDeviceLabel}
+                </span>
+                <select
+                  value={previewDeviceId}
+                  onChange={(event) => setPreviewDeviceId(event.currentTarget.value)}
+                  className={`w-full ${input}`}
+                >
+                  <option value="">{ui.settings.auditionDeviceSameAsOutput}</option>
+
+                  {auditionDeviceMissing && (
+                    <option value={previewDeviceId}>{ui.settings.audioDeviceMissing}</option>
+                  )}
+
+                  {devices.map((device) => (
+                    <option key={device.id} value={device.id}>
+                      {device.is_default
+                        ? `${device.name} — ${ui.settings.audioDeviceDefaultTag}`
+                        : device.name}
+                    </option>
+                  ))}
+                </select>
+                <span className="text-xs text-zinc-500">{ui.settings.auditionDeviceHint}</span>
+              </label>
+            </div>
+          </section>
+
+          <section className="col-span-2 space-y-4 border-t border-scena-800 pt-4">
+            <div>
+              <h3 className="text-xs font-semibold uppercase tracking-wider text-zinc-500">
+                {ui.settings.sequenceTitle}
+              </h3>
+              <p className="text-xs text-zinc-500">{ui.settings.sequenceHint}</p>
+            </div>
+
+            <div className="grid grid-cols-2 gap-x-6 gap-y-4">
+              {sequenceFields.map((field) => (
+                <label key={field.key} className="flex flex-col gap-1">
+                  <span className="text-xs font-medium text-zinc-300">{field.label}</span>
+                  <input
+                    type="number"
+                    min={field.min}
+                    max={field.max}
+                    value={executeValues[field.key] ?? ""}
+                    onChange={(event) => {
+                      // Jak wyżej: `currentTarget` jest ważne tylko do końca obsługi zdarzenia.
+                      const next = event.currentTarget.value;
+
+                      setExecuteValues((current) => ({ ...current, [field.key]: next }));
+                    }}
+                    className={`w-40 ${input}`}
+                  />
+                  <span className="text-xs text-zinc-500">{field.hint}</span>
+                </label>
+              ))}
+            </div>
           </section>
         </div>
 
