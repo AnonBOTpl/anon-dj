@@ -1,6 +1,7 @@
 import { motion } from "framer-motion";
 import { LoaderCircle, Music4, Search } from "lucide-react";
 
+import { TruncatedText } from "./TruncatedText";
 import { ui } from "../text";
 import type { TrackInfo } from "../types";
 
@@ -65,7 +66,7 @@ export function SearchScreen({
 
       {message !== null && <p className="text-lg text-red-400">{message}</p>}
 
-      <div className="w-full max-w-3xl flex-1 overflow-y-auto">
+      <div className="w-full max-w-3xl flex-1 overflow-x-hidden overflow-y-auto">
         {results.length === 0 ? (
           <p className="text-center text-lg text-zinc-500">
             {hasSearched ? ui.search.empty : ""}
@@ -87,10 +88,14 @@ export function SearchScreen({
                   <Music4 className="h-6 w-6 shrink-0 text-zinc-500" />
 
                   <span className="min-w-0 flex-1">
-                    <span className="block truncate text-xl text-zinc-100">{track.title}</span>
-                    <span className="block truncate text-base text-zinc-400">
-                      {track.artist === "" ? ui.search.noArtist : track.artist}
-                    </span>
+                    <TruncatedText
+                      text={track.title}
+                      className="block truncate text-xl text-zinc-100"
+                    />
+                    <TruncatedText
+                      text={track.artist === "" ? ui.search.noArtist : track.artist}
+                      className="block truncate text-base text-zinc-400"
+                    />
                   </span>
                 </button>
               </motion.li>

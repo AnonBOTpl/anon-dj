@@ -5,6 +5,7 @@ import { open } from "@tauri-apps/plugin-dialog";
 import { motion } from "framer-motion";
 import { FolderPlus, LoaderCircle, RefreshCw, Search, Trash } from "lucide-react";
 
+import { TruncatedText } from "./TruncatedText";
 import { ui } from "../text";
 
 /**
@@ -221,7 +222,7 @@ export function LibraryView() {
   const libraryIsEmpty = stats !== null && stats.tracks === 0;
 
   return (
-    <div className="grid h-full min-h-0 grid-cols-[22rem_1fr] gap-3">
+    <div className="grid h-full min-h-0 grid-cols-[22rem_minmax(0,1fr)] gap-3">
       <motion.section
         initial={{ opacity: 0, y: 6 }}
         animate={{ opacity: 1, y: 0 }}
@@ -233,7 +234,7 @@ export function LibraryView() {
           <p className="text-xs text-zinc-500">{ui.library.foldersHint}</p>
         </header>
 
-        <div className="min-h-0 flex-1 space-y-1.5 overflow-y-auto p-3">
+        <div className="min-h-0 flex-1 space-y-1.5 overflow-x-hidden overflow-y-auto p-3">
           {folders.length === 0 ? (
             <p className="text-sm text-zinc-500">{ui.library.foldersEmpty}</p>
           ) : (
@@ -242,12 +243,10 @@ export function LibraryView() {
                 key={folder.id}
                 className="flex items-center gap-2 rounded border border-scena-800 bg-scena-950 px-2 py-1.5"
               >
-                <span
+                <TruncatedText
+                  text={folder.path}
                   className="min-w-0 flex-1 truncate font-mono text-xs text-zinc-300"
-                  title={folder.path}
-                >
-                  {folder.path}
-                </span>
+                />
 
                 <button
                   type="button"
@@ -330,7 +329,7 @@ export function LibraryView() {
           </label>
         </header>
 
-        <div className="min-h-0 flex-1 overflow-y-auto">
+        <div className="min-h-0 flex-1 overflow-x-hidden overflow-y-auto">
           {tracks.length === 0 ? (
             <p className="p-3 text-sm text-zinc-500">
               {libraryIsEmpty ? ui.library.libraryEmpty : ui.library.searchEmpty}
@@ -341,24 +340,18 @@ export function LibraryView() {
                 key={track.id}
                 className="flex items-baseline gap-3 border-b border-scena-800/60 px-3 py-1.5 last:border-b-0"
               >
-                <span
+                <TruncatedText
+                  text={track.title}
                   className="min-w-0 flex-1 truncate text-sm text-zinc-100"
-                  title={track.title}
-                >
-                  {track.title}
-                </span>
-                <span
-                  className="w-44 shrink-0 truncate text-xs text-zinc-400"
-                  title={track.artist}
-                >
-                  {track.artist === "" ? ui.library.unknownArtist : track.artist}
-                </span>
-                <span
-                  className="w-36 shrink-0 truncate text-xs text-zinc-500"
-                  title={track.album ?? ""}
-                >
-                  {track.album ?? ui.library.unknownAlbum}
-                </span>
+                />
+                <TruncatedText
+                  text={track.artist === "" ? ui.library.unknownArtist : track.artist}
+                  className="w-44 min-w-0 shrink truncate text-xs text-zinc-400"
+                />
+                <TruncatedText
+                  text={track.album ?? ui.library.unknownAlbum}
+                  className="w-36 min-w-0 shrink truncate text-xs text-zinc-500"
+                />
                 <span className="w-10 shrink-0 text-right text-xs tabular-nums text-zinc-500">
                   {formatDuration(track.duration_ms)}
                 </span>
