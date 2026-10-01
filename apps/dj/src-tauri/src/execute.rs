@@ -20,7 +20,7 @@ use tracing::{info, warn};
 
 use crate::audio::{AudioError, PlaybackSlot, PlaybackTarget, VoiceOverPlayer};
 use crate::player::{PlaybackState, PlayerAdapter, PlayerError, PlayerStatus};
-use crate::settings::ExecutionSettings;
+use crate::settings::{ExecutionSettings, Handover};
 use crate::volume::{self, RampStep, SILENCE_DB};
 
 /// Co ile wysyłamy kolejne wartości rampy. Krótszy krok to gładsze przejście i więcej żądań;
@@ -154,6 +154,16 @@ impl Drop for StopAfterGuard<'_> {
 }
 
 /// Wykonuje całą sekwencję. Blokujące — wołający odpowiada za wątek.
+///
+/// Sposób, w jaki stary utwór ustępuje zamówionemu, wybiera [`Handover`]:
+///
+/// - [`Handover::Fade`] — duck, dedykacja, dopiero potem wyciszenie starego utworu i wejście
+///   zamówionego od ciszy (słyszalna chwila przerwy).
+/// - [`Handover::Swap`] — duck, podmiana na zamówiony **pod głosem**, na poziomie ściszenia,
+///   dedykacja leci już nad nim, a po niej zostaje samo wyrównanie głośności. Muzyka nie milknie.
+///
+/// Gdy nic nie gra, nie ma czego podmieniać ani wyciszać: dedykacja leci w ciszy, a zamówiony
+/// utwór startuje po niej i wjeżdża do głośności normalnej (PLAN.md, sekcja 7).
 pub fn run_sequence(
     app: &AppHandle,
     adapter: &dyn PlayerAdapter,
@@ -165,26 +175,109 @@ pub fn run_sequence(
     // Ściszamy tylko wtedy, gdy naprawdę coś gra. Gdy jest cisza, nie ma czego duckować
     // ani wyciszać (PLAN.md, sekcja 7).
     let something_plays = plan.start.state == PlaybackState::Playing;
+    let handover = plan.settings.handover;
 
     info!(
         request_id = plan.request_id,
-        normal_db, something_plays, "start sekwencji wykonania"
+        normal_db,
+        something_plays,
+        handover = ?handover,
+        "start sekwencji wykonania"
     );
 
-    // 1. Stary utwór nie może wciągnąć pod głos następnej pozycji playlisty, jeśli skończy się
-    //    w trakcie dedykacji.
+    // Stary utwór nie może wciągnąć pod głos następnej pozycji playlisty, jeśli skończy się
+    // w trakcie dedykacji. Przy podmianie ta sama flaga pilnuje też zamówionego utworu, gdyby
+    // ten zdążył się skończyć pod lektorem.
     let guard = StopAfterGuard::arm(adapter)?;
 
     let duck_db = volume::duck_level_db(normal_db, plan.settings.duck_percent);
 
-    // 2. Ściszamy, ale **nie zatrzymujemy** — muzyka zostaje pod głosem lektora.
-    if something_plays {
-        let plan_ramp = volume::ramp(normal_db, duck_db, plan.settings.duck_ramp_ms, RAMP_STEP_MS);
+    if matches!(handover, Handover::Swap) && something_plays {
+        // 1. Ściszamy stary utwór.
+        let duck_ramp = volume::ramp(normal_db, duck_db, plan.settings.duck_ramp_ms, RAMP_STEP_MS);
+        apply_ramp(adapter, &duck_ramp, &mut sleep)?;
 
-        apply_ramp(adapter, &plan_ramp, &mut sleep)?;
+        // 2. Podmiana pod głosem: stary schodzi do zera, a zamówiony przejmuje **na poziomie
+        //    ściszenia**. Głośność należy do odtwarzacza, więc po `play_now` trzeba ją ustawić
+        //    jawnie — inaczej zamówiony zacząłby od ciszy zostawionej przez wyciszenie.
+        let fade = volume::ramp(duck_db, SILENCE_DB, plan.settings.fade_out_ms, RAMP_STEP_MS);
+        apply_ramp(adapter, &fade, &mut sleep)?;
+        adapter.stop()?;
+
+        adapter.play_now(&plan.track_path)?;
+        adapter.set_volume_db(duck_db)?;
+
+        // 3. Dedykacja leci nad zamówionym utworem.
+        read_dedication(app, clips, plan, &mut sleep)?;
+
+        // Flaga musi zejść, zanim zamówiony utwór dobiegnie końca — ma wrócić do playlisty DJ-a.
+        drop(guard);
+
+        // 4. Zamówiony utwór wjeżdża z poziomu ściszenia do normalnej głośności.
+        let entry = volume::ramp(
+            duck_db,
+            normal_db,
+            plan.settings.start_ramp_ms,
+            RAMP_STEP_MS,
+        );
+        let outcome = apply_ramp(adapter, &entry, &mut sleep)?;
+
+        info!(
+            request_id = plan.request_id,
+            ramp = ?outcome,
+            "sekwencja wykonania zakończona (podmiana pod głosem)"
+        );
+
+        return Ok(());
     }
 
-    // 3. Dedykacja — gniazdo anteny, żeby odsłuch DJ-a jej nie uciążał ani nie gasił.
+    // 1. Ściszamy, ale **nie zatrzymujemy** — muzyka zostaje pod głosem lektora.
+    if something_plays {
+        let duck_ramp = volume::ramp(normal_db, duck_db, plan.settings.duck_ramp_ms, RAMP_STEP_MS);
+        apply_ramp(adapter, &duck_ramp, &mut sleep)?;
+    }
+
+    // 2. Dedykacja.
+    read_dedication(app, clips, plan, &mut sleep)?;
+
+    // Krótka pauza, żeby ostatnie słowo nie zderzyło się z wejściem utworu.
+    std::thread::sleep(Duration::from_millis(u64::from(plan.settings.gap_ms)));
+
+    // 3. Stary utwór schodzi do zera i zostaje zatrzymany — nie wznawiamy go.
+    if something_plays {
+        let fade = volume::ramp(duck_db, SILENCE_DB, plan.settings.fade_out_ms, RAMP_STEP_MS);
+        apply_ramp(adapter, &fade, &mut sleep)?;
+        adapter.stop()?;
+    }
+
+    // 4. Flaga musi zejść **przed** startem zamówionego utworu: inaczej foobar zatrzymałby się
+    //    także po nim, zamiast wrócić do playlisty DJ-a.
+    drop(guard);
+
+    adapter.play_now(&plan.track_path)?;
+    adapter.set_volume_db(SILENCE_DB)?;
+
+    // 5. Zamówiony utwór wjeżdża do normalnej głośności.
+    let entry = volume::ramp_up(normal_db, plan.settings.start_ramp_ms, RAMP_STEP_MS);
+    let outcome = apply_ramp(adapter, &entry, &mut sleep)?;
+
+    info!(
+        request_id = plan.request_id,
+        ramp = ?outcome,
+        "sekwencja wykonania zakończona"
+    );
+
+    Ok(())
+}
+
+/// Włącza dedykację na antenie i czeka, aż dobiegnie końca. Bezpiecznik pilnuje zawieszenia.
+fn read_dedication(
+    app: &AppHandle,
+    clips: &Arc<VoiceOverPlayer>,
+    plan: &ExecutionPlan,
+    sleep: &mut dyn FnMut(Duration),
+) -> Result<(), ExecutionError> {
+    // Gniazdo anteny, żeby odsłuch DJ-a jej nie uciążał ani nie gasił.
     clips.play(
         app,
         PlaybackSlot::OnAir,
@@ -194,11 +287,10 @@ pub fn run_sequence(
         plan.tts_volume,
     )?;
 
-    // 4. Czekamy na jej koniec.
     let mut current = || clips.on_air_target();
     let target = PlaybackTarget::Request(plan.request_id);
 
-    if !wait_for_clip(&mut current, target, &mut sleep) {
+    if !wait_for_clip(&mut current, target, sleep) {
         warn!(
             request_id = plan.request_id,
             "dedykacja nie zgłosiła końca — przerywam sekwencję"
@@ -206,35 +298,6 @@ pub fn run_sequence(
 
         return Err(ExecutionError::ClipStuck(plan.request_id));
     }
-
-    // Krótka pauza, żeby ostatnie słowo nie zderzyło się z wejściem utworu.
-    std::thread::sleep(Duration::from_millis(u64::from(plan.settings.gap_ms)));
-
-    // 5. Stary utwór schodzi do zera i zostaje zatrzymany — nie wznawiamy go.
-    if something_plays {
-        let plan_ramp = volume::ramp(duck_db, SILENCE_DB, plan.settings.fade_out_ms, RAMP_STEP_MS);
-
-        apply_ramp(adapter, &plan_ramp, &mut sleep)?;
-
-        adapter.stop()?;
-    }
-
-    // 6. Flaga musi zejść **przed** startem zamówionego utworu: inaczej foobar zatrzymałby się
-    //    także po nim, zamiast wrócić do playlisty DJ-a.
-    drop(guard);
-
-    adapter.play_now(&plan.track_path)?;
-    adapter.set_volume_db(SILENCE_DB)?;
-
-    // 7. Zamówiony utwór wjeżdża do normalnej głośności.
-    let plan_ramp = volume::ramp_up(normal_db, plan.settings.start_ramp_ms, RAMP_STEP_MS);
-    let outcome = apply_ramp(adapter, &plan_ramp, &mut sleep)?;
-
-    info!(
-        request_id = plan.request_id,
-        ramp = ?outcome,
-        "sekwencja wykonania zakończona"
-    );
 
     Ok(())
 }
@@ -423,6 +486,7 @@ mod tests {
             gap_ms: 0,
             fade_out_ms: 100,
             start_ramp_ms: 200,
+            handover: Handover::Fade,
         };
 
         // Rampy liczymy tym samym kodem co produkcja; sekwencję sprawdzamy krok po kroku.
@@ -448,6 +512,27 @@ mod tests {
         apply_ramp(&player, &start, &mut sleep).expect("wejście utworu");
 
         assert!((player.volume() - (-6.0)).abs() < 1e-9);
+    }
+
+    /// Podmiana pod głosem: zamówiony utwór przejmuje na poziomie ducku i dopiero po dedykacji
+    /// wjeżdża do głośności normalnej — inaczej niż przy wyciszeniu, gdzie startuje od ciszy.
+    #[test]
+    fn a_swapped_track_takes_over_at_the_ducked_level() {
+        let normal_db = -6.0;
+        let duck_db = volume::duck_level_db(normal_db, 33);
+
+        let entry = volume::ramp(duck_db, normal_db, 800, RAMP_STEP_MS);
+
+        assert_eq!(
+            entry.first().map(|step| step.volume_db),
+            Some(duck_db),
+            "zamówiony utwór zaczyna dokładnie tam, gdzie stał stary"
+        );
+        assert_eq!(
+            entry.last().map(|step| step.volume_db),
+            Some(normal_db),
+            "po dedykacji wjeżdża do głośności normalnej"
+        );
     }
 
     #[test]

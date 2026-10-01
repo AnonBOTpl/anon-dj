@@ -54,6 +54,8 @@ pub const KEY_EXECUTE_GAP_MS: &str = "execute.gap_ms";
 pub const KEY_EXECUTE_FADE_OUT_MS: &str = "execute.fade_out_ms";
 /// Klucz ustawienia z czasem wchodzenia zamówionego utworu do normalnej głośności.
 pub const KEY_EXECUTE_START_RAMP_MS: &str = "execute.start_ramp_ms";
+/// Klucz ustawienia ze sposobem, w jaki stary utwór ustępuje zamówionemu.
+pub const KEY_EXECUTE_HANDOVER: &str = "execute.handover";
 /// Klucz z głośnością normalną odtwarzacza na czas sekwencji wykonania.
 ///
 /// To nie jest ustawienie DJ-a, a **znacznik stanu**: niepusty wpis znaczy „sekwencja właśnie
@@ -236,6 +238,41 @@ impl Default for PlayerSettings {
     }
 }
 
+/// Sposób, w jaki stary utwór ustępuje zamówionemu (PLAN.md, sekcja 7).
+///
+/// Warianty różnią się tym, **kiedy** muzyka zmienia się pod lektorem. `Fade` wycisza stary utwór
+/// dopiero po dedykacji i startuje zamówiony od ciszy (słyszalna chwila przerwy), a `Swap`
+/// podmienia go pod głosem na poziomie ściszenia, więc muzyka gra bez przerwy.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Handover {
+    /// Stary utwór schodzi do zera po dedykacji, zamówiony wjeżdża od ciszy. Zachowanie domyślne.
+    #[default]
+    Fade,
+    /// Zamówiony utwór przejmuje pod głosem, na poziomie ściszenia, i po dedykacji wjeżdża wyżej.
+    Swap,
+}
+
+impl Handover {
+    /// Postać zapisywana w bazie. Trzymamy ją obok serializacji, żeby zapis i odczyt z bazy nie
+    /// rozjechały się z tym, co widzi interfejs.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Fade => "fade",
+            Self::Swap => "swap",
+        }
+    }
+
+    /// Odczyt z bazy. `None` dla nieznanej wartości — wołający decyduje, co zrobić.
+    fn parse(raw: &str) -> Option<Self> {
+        match raw.trim() {
+            "fade" => Some(Self::Fade),
+            "swap" => Some(Self::Swap),
+            _ => None,
+        }
+    }
+}
+
 /// Ustawienia sekwencji wykonania (PLAN.md, sekcja 7): jak muzyka zachowuje się pod lektorem.
 ///
 /// Wszystkie czasy to milisekundy — sekwencja musi umieć zagrać się w mgnieniu oka, więc jednostka
@@ -246,12 +283,18 @@ pub struct ExecutionSettings {
     pub duck_percent: u32,
     /// Jak długo ściszamy muzykę do poziomu ducku.
     pub duck_ramp_ms: u32,
-    /// Pauza po dedykacji, zanim zaczniemy wyciszać stary utwór.
+    /// Pauza po dedykacji, zanim zaczniemy wyciszać stary utwór. Używana tylko przy przejściu
+    /// [`Handover::Fade`] — przy podmianie pod głosem nie ma na co czekać.
     pub gap_ms: u32,
-    /// Jak długo wyciszamy stary utwór do zera.
+    /// Jak długo wyciszamy stary utwór do zera: po dedykacji ([`Handover::Fade`]) albo pod głosem,
+    /// tuż przed podmianą ([`Handover::Swap`]).
     pub fade_out_ms: u32,
     /// Jak długo zamówiony utwór wjeżdża do normalnej głośności.
     pub start_ramp_ms: u32,
+    /// Kiedy muzyka zmienia się pod lektorem. `default` — starszy interfejs bez tego pola nadal
+    /// zapisze ustawienia, i to z dotychczasowym zachowaniem (wyciszenie po dedykacji).
+    #[serde(default)]
+    pub handover: Handover,
 }
 
 impl Default for ExecutionSettings {
@@ -262,6 +305,7 @@ impl Default for ExecutionSettings {
             gap_ms: DEFAULT_GAP_MS,
             fade_out_ms: DEFAULT_FADE_OUT_MS,
             start_ramp_ms: DEFAULT_START_RAMP_MS,
+            handover: Handover::default(),
         }
     }
 }
@@ -368,6 +412,7 @@ impl AppSettings {
                     .unwrap_or(defaults.execute.fade_out_ms),
                 start_ramp_ms: read_u32(db, KEY_EXECUTE_START_RAMP_MS)?
                     .unwrap_or(defaults.execute.start_ramp_ms),
+                handover: read_handover(db)?,
             },
         };
 
@@ -436,6 +481,7 @@ impl AppSettings {
             KEY_EXECUTE_START_RAMP_MS,
             &self.execute.start_ramp_ms.to_string(),
         )?;
+        db.set_setting(KEY_EXECUTE_HANDOVER, self.execute.handover.as_str())?;
 
         Ok(())
     }
@@ -618,6 +664,22 @@ fn read_port(db: &Db, key: &str) -> Result<Option<u16>, SettingsError> {
     }
 }
 
+/// Odczyt sposobu przejścia z ustawień. Nieznana wartość jest traktowana jak brak wpisu —
+/// stare albo ręcznie poprawione ustawienie nie może zablokować sekwencji przed imprezą.
+fn read_handover(db: &Db) -> Result<Handover, SettingsError> {
+    match db.setting(KEY_EXECUTE_HANDOVER)? {
+        Some(raw) => match Handover::parse(&raw) {
+            Some(handover) => Ok(handover),
+            None => {
+                warn!(raw = %raw, "nieznany sposób przejścia sekwencji, używam domyślnego");
+
+                Ok(Handover::default())
+            }
+        },
+        None => Ok(Handover::default()),
+    }
+}
+
 fn read_u32(db: &Db, key: &str) -> Result<Option<u32>, SettingsError> {
     match db.setting(key)? {
         Some(raw) => match raw.trim().parse::<u32>() {
@@ -697,6 +759,7 @@ mod tests {
                 gap_ms: 250,
                 fade_out_ms: 500,
                 start_ramp_ms: 900,
+                handover: Handover::Swap,
             },
         };
 
@@ -723,6 +786,67 @@ mod tests {
             settings.validate().is_ok(),
             "cisza pod lektorem jest dopuszczalnym wyborem DJ-a"
         );
+    }
+
+    #[test]
+    fn the_handover_round_trips_and_unknown_values_fall_back_to_the_default() {
+        let db = Db::open_in_memory().expect("baza w pamięci");
+
+        let mut settings = AppSettings::default();
+        assert_eq!(
+            settings.execute.handover,
+            Handover::Fade,
+            "świeża instalacja zachowuje dotychczasowe zachowanie"
+        );
+
+        settings.execute.handover = Handover::Swap;
+        settings.save(&db).expect("zapis ustawień");
+
+        assert_eq!(
+            AppSettings::load(&db)
+                .expect("odczyt ustawień")
+                .execute
+                .handover,
+            Handover::Swap
+        );
+
+        db.set_setting(KEY_EXECUTE_HANDOVER, "zupelnie nie to")
+            .expect("zapis do bazy");
+
+        assert_eq!(
+            AppSettings::load(&db)
+                .expect("odczyt ustawień")
+                .execute
+                .handover,
+            Handover::Fade,
+            "nieznana wartość nie może zablokować sekwencji"
+        );
+    }
+
+    #[test]
+    fn an_older_interface_without_the_handover_field_keeps_the_default() {
+        let settings: AppSettings = serde_json::from_str(
+            r#"{
+                "pin": "123456",
+                "port": 8790,
+                "confirmation_seconds": 20,
+                "limits": {
+                    "dedication_max_chars": 400,
+                    "guest_name_max_chars": 40,
+                    "search_query_max_chars": 80
+                },
+                "execute": {
+                    "duck_percent": 33,
+                    "duck_ramp_ms": 600,
+                    "gap_ms": 300,
+                    "fade_out_ms": 400,
+                    "start_ramp_ms": 800
+                }
+            }"#,
+        )
+        .expect("starszy interfejs bez pola przejścia");
+
+        assert_eq!(settings.execute.handover, Handover::Fade);
     }
 
     #[test]

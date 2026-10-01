@@ -16,7 +16,13 @@ od internetu. Pliki muzyczne nigdy nie są kopiowane: baza trzyma wyłącznie me
 3. **Lektor** — po zatwierdzeniu dedykacji (albo po jej poprawce) voice-over liczy się w tle,
    z widocznym statusem i paskiem postępu, i zapisuje się w pamięci podręcznej. Dzięki temu
    „Wykonaj” nie czeka na syntezę.
-4. **Wykonanie** — dedykacja leci z głośników, a po niej utwór puszczony w foobar2000.
+4. **Wykonanie** — ściszenie grającego utworu, dedykacja nad nim i zamówiony utwór puszczony
+   w foobar2000. W ustawieniach wybiera się sposób przejścia: **wyciszenie po dedykacji** (stary
+   utwór znika dopiero po niej, jest krótka przerwa) albo **podmiana pod głosem** (zamówiony
+   przejmuje w trakcie dedykacji, na poziomie ściszenia, więc muzyka gra bez przerwy).
+
+Dedykację odsłuchuje się na **osobnym urządzeniu** (np. słuchawkach) — sprawdzanie voice-overu
+nie idzie wtedy na salę i nie przerywa tego, co już leci na antenie.
 
 Komunikacja DJ ↔ kiosk idzie po WebSocket w sieci lokalnej i wymaga PIN-u parowania. Zarówno
 DJ, jak i kiosk startują niezależnie — brak kiosku nigdy nie blokuje aplikacji DJ-a.

@@ -4,7 +4,7 @@ import { motion } from "framer-motion";
 import { Save, X } from "lucide-react";
 
 import { ui } from "../text";
-import type { AppSettings, ExecutionSettings, OutputDevice } from "../types";
+import type { AppSettings, ExecutionSettings, Handover, OutputDevice } from "../types";
 
 /** Zakres czasu powrotu ekranu potwierdzenia — musi zgadzać się ze stałą w `settings.rs`. */
 const CONFIRMATION_SECONDS_RANGE = { min: 5, max: 300 } as const;
@@ -13,8 +13,11 @@ const CONFIRMATION_SECONDS_RANGE = { min: 5, max: 300 } as const;
  * Pola strojenia sekwencji wykonania. Zakresy muszą zgadzać się ze stałymi w `settings.rs`
  * (`DUCK_PERCENT_RANGE` i `EXECUTE_MS_RANGE`) — poza nimi Rust odrzuci zapis.
  */
+/** Pola liczbowe sekwencji — bez `handover`, bo to wybór, a nie liczba. */
+type SequenceNumberKey = Exclude<keyof ExecutionSettings, "handover">;
+
 const sequenceFields: {
-  key: keyof ExecutionSettings;
+  key: SequenceNumberKey;
   label: string;
   hint: string;
   min: number;
@@ -95,6 +98,7 @@ export function SettingsDialog({ onClose }: { onClose: () => void }) {
   const [audioDeviceId, setAudioDeviceId] = useState("");
   const [previewDeviceId, setPreviewDeviceId] = useState("");
   const [executeValues, setExecuteValues] = useState<Record<string, string>>({});
+  const [handover, setHandover] = useState<Handover>("fade");
   const [devices, setDevices] = useState<OutputDevice[]>([]);
   // Czy lista urządzeń zdążyła się wczytać — dopiero wtedy umiemy powiedzieć, że zapisane
   // urządzenie zniknęło, a nie tylko że lista jest jeszcze pusta.
@@ -131,6 +135,7 @@ export function SettingsDialog({ onClose }: { onClose: () => void }) {
             sequenceFields.map((field) => [field.key, String(settings.execute[field.key])]),
           ),
         );
+        setHandover(settings.execute.handover);
       })
       .catch((reason: unknown) => {
         if (active) {
@@ -236,6 +241,7 @@ export function SettingsDialog({ onClose }: { onClose: () => void }) {
       gap_ms: 0,
       fade_out_ms: 0,
       start_ramp_ms: 0,
+      handover,
     };
 
     for (const field of sequenceFields) {
@@ -471,6 +477,28 @@ export function SettingsDialog({ onClose }: { onClose: () => void }) {
             </div>
 
             <div className="grid grid-cols-2 gap-x-6 gap-y-4">
+              <label className="col-span-2 flex flex-col gap-1">
+                <span className="text-xs font-medium text-zinc-300">
+                  {ui.settings.handoverLabel}
+                </span>
+                <select
+                  value={handover}
+                  onChange={(event) =>
+                    setHandover(event.currentTarget.value === "swap" ? "swap" : "fade")
+                  }
+                  className={`w-full ${input}`}
+                >
+                  <option value="fade">{ui.settings.handoverFade}</option>
+                  <option value="swap">{ui.settings.handoverSwap}</option>
+                </select>
+                <span className="text-xs text-zinc-500">{ui.settings.handoverHint}</span>
+                <span className="text-xs text-zinc-500">
+                  {handover === "swap"
+                    ? ui.settings.handoverSwapHint
+                    : ui.settings.handoverFadeHint}
+                </span>
+              </label>
+
               {sequenceFields.map((field) => (
                 <label key={field.key} className="flex flex-col gap-1">
                   <span className="text-xs font-medium text-zinc-300">{field.label}</span>

@@ -83,6 +83,12 @@ export type PlayerSettings = {
 };
 
 /**
+ * Sposób, w jaki stary utwór ustępuje zamówionemu — zgadza się z `Handover`
+ * w `src-tauri/src/settings.rs`.
+ */
+export type Handover = "fade" | "swap";
+
+/**
  * Strojenie sekwencji wykonania — zgadza się z typem `ExecutionSettings`
  * w `src-tauri/src/settings.rs`. Wszystkie czasy w milisekundach.
  */
@@ -91,12 +97,14 @@ export type ExecutionSettings = {
   duck_percent: number;
   /** Jak długo ściszamy do poziomu ducku. */
   duck_ramp_ms: number;
-  /** Pauza po dedykacji, zanim zaczniemy wyciszać stary utwór. */
+  /** Pauza po dedykacji (tylko przy przejściu „fade”). */
   gap_ms: number;
-  /** Jak długo wyciszamy stary utwór. */
+  /** Jak długo wyciszamy stary utwór do zera. */
   fade_out_ms: number;
   /** Jak długo zamówiony utwór wjeżdża do normalnej głośności. */
   start_ramp_ms: number;
+  /** Kiedy muzyka zmienia się pod lektorem. */
+  handover: Handover;
 };
 
 /** Ustawienia DJ-a — zgadzają się z typem `AppSettings` w `src-tauri/src/settings.rs`. */
