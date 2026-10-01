@@ -39,6 +39,27 @@ pub struct VoiceTuning {
     pub sentence_silence_ms: u32,
 }
 
+/// Docelowy pik klipu, do którego wyrównujemy nagranie.
+///
+/// Trochę poniżej pełnej skali, żeby zaokrąglenie do 16 bitów i miksowanie w systemie nie
+/// wprowadzało trzasków.
+const TARGET_PEAK: f32 = 0.97;
+
+/// Największe wzmocnienie, jakie wolno nałożyć przy wyrównywaniu.
+///
+/// Bez tego granicy cisza-plus-szum zamieniłyby się w głośny szum. +12 dB to i tak dużo — tyle
+/// wystarcza na najcichsze klipy, jakie widzieliśmy.
+const MAX_NORMALIZE_GAIN_DB: f32 = 12.0;
+
+/// Poniżej tego piku uznajemy nagranie za ciszę i nie ruszamy go wcale.
+const SILENT_PEAK: f32 = 0.001;
+
+/// Wersja sposobu zapisu klipu.
+///
+/// Wchodzi do nazwy pliku, więc podniesienie jej sprawia, że klipy policzone starą metodą
+/// **zostaną policzone na nowo**, zamiast zostać w pamięci podręcznej w starej, cichej postaci.
+const CLIP_FORMAT_VERSION: u32 = 2;
+
 /// Pauza między zdaniami, od której startujemy. Jednocześnie punkt odniesienia dla silnika:
 /// `sherpa-onnx` przyjmuje pauzę jako mnożnik, więc dzielimy przez tę wartość.
 pub const DEFAULT_SENTENCE_SILENCE_MS: u32 = 200;
@@ -177,12 +198,15 @@ impl ClipCache {
 /// wartości między wersjami kompilatora, a wtedy cache zacząłby się „gubić” bez powodu.
 fn cache_key(voice_id: &str, text: &str, tuning: &VoiceTuning) -> String {
     // Znacznik \u{1f} rozdziela pola; w dedykacji ani w nazwie głosu się nie pojawi.
+    //
+    // Głośności **nie ma w kluczu**: to mnożnik nakładany dopiero przy odtwarzaniu, więc zmiana
+    // suwaka nie zmienia ani jednej próbki w pliku. Wcześniej była tu i kazała liczyć klip
+    // po raz drugi bez żadnego powodu.
     let fingerprint = format!(
-        "{voice_id}\u{1f}{text}\u{1f}{},{},{},{},{}",
+        "v{CLIP_FORMAT_VERSION}\u{1f}{voice_id}\u{1f}{text}\u{1f}{},{},{},{}",
         tuning.length_scale_milli,
         tuning.noise_scale_milli,
         tuning.noise_w_milli,
-        tuning.volume_percent,
         tuning.sentence_silence_ms,
     );
 
@@ -196,11 +220,46 @@ fn cache_key(voice_id: &str, text: &str, tuning: &VoiceTuning) -> String {
     format!("{hash:016x}")
 }
 
+/// Wyrównuje nagranie tak, żeby jego najgłośniejszy fragment sięgał [`TARGET_PEAK`].
+///
+/// Silnik syntezy nie pilnuje poziomu: jedne dedykacje wychodzą cicho, inne głośno, a różnica
+/// między nimi sięga kilkunastu decybeli. Wyrównanie piku daje dwie rzeczy naraz — dedykacja jest
+/// **słyszalna** na tle ściszonej muzyki i **zawsze tak samo głośna**, niezależnie od tekstu i głosu.
+///
+/// Zwraca nałożone wzmocnienie (`1.0` = bez zmian). Ciszy i nagrań, którym wystarczy mniej niż
+/// decybel, nie ruszamy — patrz [`SILENT_PEAK`] i [`MAX_NORMALIZE_GAIN_DB`].
+pub fn normalize_peak(samples: &mut [f32]) -> f32 {
+    let peak = samples
+        .iter()
+        .fold(0.0_f32, |loudest, sample| loudest.max(sample.abs()));
+
+    if peak < SILENT_PEAK {
+        return 1.0;
+    }
+
+    let max_gain = 10.0_f32.powf(MAX_NORMALIZE_GAIN_DB / 20.0);
+    // Nigdy nie ściszamy: klip, który już jest głośny, ma taki zostać.
+    let gain = (TARGET_PEAK / peak).clamp(1.0, max_gain);
+
+    if gain > 1.0 {
+        for sample in samples.iter_mut() {
+            *sample = (*sample * gain).clamp(-1.0, 1.0);
+        }
+    }
+
+    gain
+}
+
 /// Zapisuje próbki jako 16-bitowy WAV mono i zwraca gotowy klip.
 ///
 /// Leży tutaj, a nie w implementacji silnika, bo format klipu jest umową całej warstwy TTS —
-/// dzięki temu każdy silnik zapisuje dokładnie to samo.
+/// dzięki temu każdy silnik zapisuje dokładnie to samo. Próbki są przy okazji wyrównywane
+/// ([`normalize_peak`]), żeby cicha dedykacja nie została cicha na zawsze.
 pub fn write_wav(path: &Path, samples: &[f32], sample_rate: u32) -> Result<Clip, TtsError> {
+    let mut samples = samples.to_vec();
+
+    normalize_peak(&mut samples);
+
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|error| TtsError::io(parent, error))?;
     }
@@ -374,6 +433,37 @@ mod tests {
             .expect("usunięcie nieistniejącego klipu");
     }
 
+    /// Sedno sprawy: wyrównanie musi trafić **do pliku**, a nie zostać policzone i porzucone.
+    /// Inaczej cicha dedykacja zostałaby cicha na zawsze.
+    #[test]
+    fn a_written_clip_is_loud_regardless_of_what_the_engine_gave() {
+        let dir = temp_dir("normalized-on-disk");
+        let path = dir.join("cicha.wav");
+
+        // Silnik oddaje ciche próbki — dokładnie tak, jak bywa w praktyce.
+        let mut samples = vec![0.0_f32; 4_000];
+        samples[100] = 0.5;
+        samples[101] = -0.5;
+
+        write_wav(&path, &samples, 16_000).expect("zapis klipu");
+
+        let bytes = std::fs::read(&path).expect("odczyt pliku");
+        let peak = bytes[44..]
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|pair| i16::from_le_bytes(*pair).unsigned_abs())
+            .max()
+            .expect("próbki");
+
+        let peak = f32::from(peak) / f32::from(i16::MAX);
+
+        assert!(
+            (peak - TARGET_PEAK).abs() < 0.01,
+            "pik w pliku to {peak}, a miał być blisko {TARGET_PEAK}"
+        );
+    }
+
     #[test]
     fn a_clip_on_disk_can_be_read_back_without_synthesis() {
         let dir = temp_dir("read-back");
@@ -404,6 +494,79 @@ mod tests {
             read_clip(&dir.join("nie-ma-takiego.wav")),
             Err(TtsError::Io { .. })
         ));
+    }
+
+    #[test]
+    fn a_quiet_clip_is_lifted_to_the_target_peak() {
+        let mut samples = vec![0.0_f32; 100];
+        samples[7] = 0.25;
+        samples[8] = -0.25;
+
+        let gain = normalize_peak(&mut samples);
+        let peak = samples
+            .iter()
+            .fold(0.0_f32, |loudest, s| loudest.max(s.abs()));
+
+        assert!(
+            (gain - TARGET_PEAK / 0.25).abs() < 1e-4,
+            "wzmocnienie {gain}"
+        );
+        assert!(
+            (peak - TARGET_PEAK).abs() < 1e-4,
+            "pik po wyrównaniu to {peak}, a miał być {TARGET_PEAK}"
+        );
+    }
+
+    #[test]
+    fn an_already_loud_clip_is_not_quieted_down() {
+        let mut samples = vec![0.0_f32; 10];
+        // Głośniej niż cel — ściszanie odebrałoby głośność, o którą DJ walczył na suwaku.
+        samples[3] = 0.99;
+
+        let gain = normalize_peak(&mut samples);
+
+        assert!((gain - 1.0).abs() < f32::EPSILON, "wzmocnienie {gain}");
+        assert!(
+            (samples[3] - 0.99).abs() < 1e-6,
+            "głośnego klipu nie ruszamy"
+        );
+    }
+
+    #[test]
+    fn a_clip_close_to_the_target_is_only_nudged_up() {
+        let mut samples = vec![0.0_f32; 10];
+        samples[3] = 0.95;
+
+        let gain = normalize_peak(&mut samples);
+
+        assert!(
+            (gain - TARGET_PEAK / 0.95).abs() < 1e-6,
+            "wzmocnienie {gain}"
+        );
+        assert!(samples[3] <= TARGET_PEAK + 1e-6, "bez przekroczenia skali");
+    }
+
+    #[test]
+    fn silence_stays_silent() {
+        let mut samples = vec![0.0_f32; 64];
+
+        assert!((normalize_peak(&mut samples) - 1.0).abs() < f32::EPSILON);
+        assert!(samples.iter().all(|sample| *sample == 0.0));
+    }
+
+    #[test]
+    fn a_whisper_is_not_amplified_into_noise() {
+        let mut samples = vec![0.0_f32; 64];
+        // Powyżej progu ciszy, ale tak cicho, że pełne wyrównanie byłoby już szumem.
+        samples[0] = 0.002;
+
+        let max_gain = 10.0_f32.powf(MAX_NORMALIZE_GAIN_DB / 20.0);
+        let gain = normalize_peak(&mut samples);
+
+        assert!(
+            (gain - max_gain).abs() < 1e-3,
+            "wzmocnienie musi być ograniczone do {max_gain}, a jest {gain}"
+        );
     }
 
     #[test]
