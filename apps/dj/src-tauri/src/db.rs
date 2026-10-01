@@ -10,6 +10,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use protocol::{RequestStatus, TrackInfo};
 use rusqlite::{Connection, OptionalExtension, params};
+use tracing::info;
 
 /// Migracje w kolejności stosowania. Każda następna podnosi `user_version` o jeden.
 const MIGRATIONS: &[&str] = &[
@@ -17,6 +18,17 @@ const MIGRATIONS: &[&str] = &[
     include_str!("../migrations/0002_library.sql"),
     include_str!("../migrations/0003_review_queue.sql"),
 ];
+
+/// Klucz ustawienia z wersją sposobu składania tekstu do wyszukiwania.
+const KEY_FOLD_VERSION: &str = "library.fold_version";
+
+/// Wersja sposobu składania tekstu do wyszukiwania ([`fold_for_search`]).
+///
+/// Podbijamy ją przy każdej zmianie normalizacji, bo kolumny `title_fold` i `artist_fold`
+/// powstają w chwili zapisu utworu. Po aktualizacji aplikacji stare wpisy nie pasowałyby do
+/// nowych zapytań — i wyszukiwanie po cichu zgubiłoby część biblioteki, dopóki DJ nie przeskanuje
+/// jej od nowa. Dlatego przy pierwszym otwarciu bazy przechodzimy wzorzec przez `refresh_search_folds`.
+const FOLD_VERSION: &str = "2";
 
 /// Błąd warstwy bazy danych.
 #[derive(Debug, thiserror::Error)]
@@ -81,10 +93,11 @@ impl Db {
         Self::from_connection(Connection::open_in_memory()?)
     }
 
-    fn from_connection(conn: Connection) -> Result<Self, DbError> {
+    fn from_connection(mut conn: Connection) -> Result<Self, DbError> {
         // Wymuszamy klucze obce — dzięki temu literówka w track_id nie przejdzie po cichu.
         conn.pragma_update(None, "foreign_keys", "ON")?;
         apply_migrations(&conn)?;
+        refresh_search_folds(&mut conn)?;
 
         Ok(Self {
             conn: Mutex::new(conn),
@@ -787,10 +800,46 @@ pub struct LibraryFolder {
 /// Postać tekstu używana przy wyszukiwaniu.
 ///
 /// SQLite porównuje `LIKE` bez rozróżniania wielkości liter **tylko dla ASCII** — dla niego
-/// „Ł” i „ł” to dwa różne znaki. Normalizujemy więc tekst po stronie Rusta (Unicode-aware
-/// `to_lowercase`) i zapisujemy gotową postać w osobnej kolumnie.
+/// „Ł” i „ł” to dwa różne znaki. Normalizujemy więc tekst po stronie Rusta i zapisujemy gotową
+/// postać w osobnej kolumnie: najpierw Unicode-aware `to_lowercase`, a potem zdjęcie znaków
+/// diakrytycznych.
+///
+/// Zdjęcie ogonków jest tu ważniejsze niż wielkość liter: gość pisze z pamięci, w hałasie i na
+/// klawiaturze, której nie zna, więc „lagodna”, „zolw” i „wisla” muszą znaleźć „Łagodną”,
+/// „Żółwia” i „Wisłę”. Bez tego połowa biblioteki jest dla niego niewidoczna.
 pub fn fold_for_search(value: &str) -> String {
-    value.to_lowercase()
+    value.to_lowercase().chars().map(fold_character).collect()
+}
+
+/// Sprowadza literę z diakrytykiem do jej podstawy. Wejście jest już po `to_lowercase`,
+/// więc wystarczą małe litery.
+///
+/// Świadomie tylko znaki, które są jedną literą w Unicode: `ß` → `ss` zmieniłoby długość tekstu,
+/// a polskiej biblioteki to nie dotyczy.
+fn fold_character(character: char) -> char {
+    match character {
+        // Polski
+        'ą' => 'a',
+        'ć' => 'c',
+        'ę' => 'e',
+        'ł' => 'l',
+        'ń' => 'n',
+        'ó' => 'o',
+        'ś' => 's',
+        'ź' | 'ż' => 'z',
+        // Reszta łaciny: „Björk”, „Céline”, „Mötley” mają w bibliotece każdy DJ
+        'à' | 'á' | 'â' | 'ã' | 'ä' | 'å' => 'a',
+        'è' | 'é' | 'ê' | 'ë' => 'e',
+        'ì' | 'í' | 'î' | 'ï' => 'i',
+        'ò' | 'ô' | 'õ' | 'ö' => 'o',
+        'ù' | 'ú' | 'û' | 'ü' => 'u',
+        'ç' => 'c',
+        'ñ' => 'n',
+        'ý' | 'ÿ' => 'y',
+        'š' => 's',
+        'ž' => 'z',
+        _ => character,
+    }
 }
 
 /// Escapuje znaki specjalne `LIKE`, żeby `%` albo `_` z tytułu nie zamieniły się w wieloznacznik.
@@ -859,6 +908,61 @@ fn apply_migrations(conn: &Connection) -> Result<(), DbError> {
     {
         conn.execute_batch(migration)?;
         conn.pragma_update(None, "user_version", (index + 1) as i64)?;
+    }
+
+    Ok(())
+}
+
+/// Przelicza kolumny wyszukiwania, gdy zmienił się sposób składania tekstu.
+///
+/// Wołane raz przy otwarciu bazy. Świeża instalacja nie ma czego przeliczać (biblioteka jest
+/// pusta), ale baza po aktualizacji aplikacji ma — i bez tego DJ szukałby „lagodnej” w bibliotece,
+/// w której leży „łagodna”, i nie znajdowałby nic.
+fn refresh_search_folds(conn: &mut Connection) -> Result<(), DbError> {
+    let stored: Option<String> = conn
+        .query_row(
+            "SELECT value FROM settings WHERE key = ?1",
+            params![KEY_FOLD_VERSION],
+            |row| row.get(0),
+        )
+        .optional()?;
+
+    if stored.as_deref() == Some(FOLD_VERSION) {
+        return Ok(());
+    }
+
+    // Wiersze zbieramy przed transakcją: nie da się update'ować tabeli, po której właśnie
+    // wędruje kursor.
+    let tracks: Vec<(i64, String, String)> = {
+        let mut statement = conn.prepare("SELECT id, title, artist FROM tracks")?;
+        let rows = statement.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?;
+
+        rows.collect::<Result<Vec<_>, _>>()?
+    };
+
+    let transaction = conn.transaction()?;
+
+    {
+        let mut statement = transaction
+            .prepare("UPDATE tracks SET title_fold = ?2, artist_fold = ?3 WHERE id = ?1")?;
+
+        for (id, title, artist) in &tracks {
+            statement.execute(params![id, fold_for_search(title), fold_for_search(artist)])?;
+        }
+    }
+
+    transaction.execute(
+        "INSERT INTO settings (key, value) VALUES (?1, ?2)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        params![KEY_FOLD_VERSION, FOLD_VERSION],
+    )?;
+    transaction.commit()?;
+
+    if !tracks.is_empty() {
+        info!(
+            tracks = tracks.len(),
+            "przeliczyłem postacie wyszukiwania w bibliotece"
+        );
     }
 
     Ok(())
@@ -1081,6 +1185,88 @@ mod tests {
             db.search_tracks("nirvana", 50)
                 .expect("szukanie")
                 .is_empty()
+        );
+    }
+
+    #[test]
+    fn search_finds_polish_titles_typed_without_diacritics() {
+        let db = Db::open_in_memory().expect("baza w pamięci");
+
+        store_track(&db, "C:\\muzyka\\lagodna.mp3", "Łagodna", "Zespół");
+        store_track(&db, "C:\\muzyka\\zolw.mp3", "Żółw", "Zespół");
+        store_track(
+            &db,
+            "C:\\muzyka\\motley.mp3",
+            "Kickstart My Heart",
+            "Mötley Crüe",
+        );
+
+        assert_eq!(
+            db.search_tracks("lagodna", 50).expect("szukanie").len(),
+            1,
+            "gość pisze z pamięci i bez ogonków — musi znaleźć „Łagodną”"
+        );
+        assert_eq!(
+            db.search_tracks("ZOLW", 50).expect("szukanie").len(),
+            1,
+            "wielkie litery bez ogonków też mają działać"
+        );
+        assert_eq!(
+            db.search_tracks("ŁAGODNA", 50).expect("szukanie").len(),
+            1,
+            "pisanie z ogonkami dalej działa"
+        );
+        assert_eq!(
+            db.search_tracks("motley crue", 50).expect("szukanie").len(),
+            1,
+            "biblioteka DJ-a to nie tylko polskie tytuły"
+        );
+    }
+
+    #[test]
+    fn folding_lowercases_and_strips_diacritics() {
+        assert_eq!(fold_for_search("Żółć"), "zolc");
+        assert_eq!(fold_for_search("Łagodna"), "lagodna");
+        assert_eq!(fold_for_search("  Kombi  "), "  kombi  ");
+        assert_eq!(fold_for_search("Mötley Crüe"), "motley crue");
+        assert_eq!(
+            fold_for_search("Dysk 100%"),
+            "dysk 100%",
+            "znaki spoza alfabetu zostają — escapowaniem zajmuje się zapytanie"
+        );
+    }
+
+    #[test]
+    fn an_existing_library_gets_its_search_folds_rebuilt() {
+        let db = Db::open_in_memory().expect("baza w pamięci");
+
+        // Udajemy bazę sprzed poprawki: w kolumnach wyszukiwania siedzą jeszcze polskie znaki,
+        // a wersji sposobu ich składania nie ma.
+        {
+            let conn = db.lock().expect("blokada bazy");
+
+            conn.execute(
+                "INSERT INTO tracks
+                     (path, title, artist, album, duration_ms, added_at, title_fold, artist_fold)
+                 VALUES ('C:\\muzyka\\lagodna.mp3', 'Łagodna', 'Zespół', NULL, NULL, 0, 'łagodna', 'zespół')",
+                [],
+            )
+            .expect("utwór zapisany po staremu");
+            conn.execute(
+                "DELETE FROM settings WHERE key = ?1",
+                params![KEY_FOLD_VERSION],
+            )
+            .expect("baza bez wersji składania tekstu");
+        }
+
+        let mut conn = db.lock().expect("blokada bazy");
+        refresh_search_folds(&mut conn).expect("przeliczenie kolumn");
+        drop(conn);
+
+        assert_eq!(
+            db.search_tracks("lagodna", 50).expect("szukanie").len(),
+            1,
+            "po aktualizacji aplikacji stare wpisy muszą odpowiadać na nowe zapytania"
         );
     }
 
