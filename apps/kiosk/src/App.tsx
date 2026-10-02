@@ -38,6 +38,19 @@ const SUGGEST_DEBOUNCE_MS = 200;
  */
 const MIN_SUGGEST_QUERY_CHARS = 2;
 
+/**
+ * Co ile odświeżamy listę pod wpisaną frazą.
+ *
+ * Kiosk nie ma skąd wiedzieć, że DJ właśnie zeskanował bibliotekę — nie ma o tym żadnego
+ * komunikatu w protokole. Fraza gościa się przy tym nie zmienia, więc bez tego odświeżenia
+ * gość, który wpisał frazę w pustą bibliotekę, nie zobaczy wyników aż do następnego dotknięcia
+ * klawiatury (zgłoszenie DJ-a: „kiosk nie dostaje aktualizacji”).
+ *
+ * Odpytanie jest tanie i mieści się w osobnym budżecie podpowiedzi (60 komunikatów na 10 s),
+ * więc nie zjada limitu przeznaczonego na wyszukiwania i zgłoszenia gościa.
+ */
+const SEARCH_REFRESH_MS = 5_000;
+
 /** Komunikat dla gościa. Kody błędów z sieci tłumaczymy tutaj — po sieci nie jadą teksty. */
 function errorText(code: ErrorCode): string {
   return ui.errors[code] ?? ui.errors.unknown;
@@ -65,6 +78,8 @@ export default function App() {
   const [sending, setSending] = useState(false);
   const [sentStatus, setSentStatus] = useState<RequestStatus>("submitted");
   const [sentSecondsLeft, setSentSecondsLeft] = useState(FALLBACK_CONFIRMATION_SECONDS);
+  // Licznik, który sam z siebie odświeża listę wyników — patrz [`SEARCH_REFRESH_MS`].
+  const [refreshTick, setRefreshTick] = useState(0);
 
   // Identyfikatory trzymamy w referencjach: nasłuchy nie mogą się przepinać przy każdej zmianie.
   const searchRequestId = useRef<number | null>(null);
@@ -186,7 +201,21 @@ export default function App() {
       active = false;
       window.clearTimeout(timer);
     };
-  }, [query, screen, connection.state]);
+  }, [query, screen, connection.state, refreshTick]);
+
+  // Odświeżanie w tle: tyka tylko na ekranie szukania i tylko przy działającym połączeniu.
+  useEffect(() => {
+    if (connection.state !== "connected" || screen !== "search") {
+      return;
+    }
+
+    const timer = window.setInterval(
+      () => setRefreshTick((tick) => tick + 1),
+      SEARCH_REFRESH_MS,
+    );
+
+    return () => window.clearInterval(timer);
+  }, [screen, connection.state]);
 
   /* Czas powrotu ustawia DJ w swojej aplikacji — kiosk dostaje go przy parowaniu. */
   const confirmationSeconds =

@@ -27,6 +27,16 @@ const EVENT_PLAYBACK = "audio://playback";
 /** Limit dedykacji z protokołu — używany tylko do czasu wczytania ustawień DJ-a. */
 const FALLBACK_DEDICATION_CHARS = 400;
 
+/**
+ * Co ile odświeżamy kolejki, gdy nic się nie dzieje.
+ *
+ * Zdarzenie `requests://changed` daje natychmiastową reakcję, ale potrafi przepaść — dokładnie
+ * tak zastygał chip kiosku, zanim doszło do niego odpytanie. Bez tej siatki DJ widzi nową
+ * dedykację dopiero po przełączeniu widoku i powrocie (wtedy widok montuje się od nowa).
+ * Odpytanie w tle jest tanie: to trzy zapytania do lokalnej bazy.
+ */
+const QUEUE_POLL_MS = 5_000;
+
 /** Trzy kolejki DJ-a: do przeglądu, gotowe do wykonania i historia. */
 type Queues = {
   review: QueuedRequest[];
@@ -116,8 +126,17 @@ export function QueuesView() {
       });
     });
 
+    // Siatka bezpieczeństwa wobec zdarzenia, które mogło przepaść. Cicha: chwilowy brak danych
+    // nie może podmienić tego, co DJ już widzi na ekranie, ani zamrugać komunikatem błędu.
+    const timer = window.setInterval(() => {
+      void refresh().catch(() => {
+        // Nic nie robimy — następny cykl spróbuje znowu.
+      });
+    }, QUEUE_POLL_MS);
+
     return () => {
       active = false;
+      window.clearInterval(timer);
       void unlisten.then((stop) => stop());
     };
   }, [refresh]);

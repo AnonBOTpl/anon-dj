@@ -1495,6 +1495,120 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_kiosk_sees_tracks_added_after_it_connected() {
+        // Zgłoszenie DJ-a: biblioteka była pusta, DJ ją zeskanował przy działającym kiosku,
+        // a gość nadal nic nie znajdował. Sprawdzamy, że wyszukiwanie idzie po aktualnej bazie,
+        // a nie po stanie z chwili połączenia kiosku.
+        let db = Arc::new(Db::open_in_memory().expect("baza w pamięci"));
+        let port = free_port();
+        let (_server, _events) = start_server(&db, port);
+
+        let mut ws = connect(port).await;
+        send_message(&mut ws, &hello(DEFAULT_PIN)).await;
+        assert!(next_message(&mut ws).await.is_some(), "parowanie");
+
+        // Biblioteka jest jeszcze pusta — gość nie ma czego znaleźć.
+        let search = KioskMessage::Search {
+            request_id: 1,
+            query: "Kombi".to_string(),
+        };
+
+        send_message(&mut ws, &search).await;
+
+        match next_message(&mut ws).await {
+            Some(DjMessage::SearchResults { tracks, .. }) => {
+                assert!(tracks.is_empty(), "pusta biblioteka nie ma wyników");
+            }
+            other => panic!("oczekiwano wyników wyszukiwania, a przyszło {other:?}"),
+        }
+
+        // DJ kończy skanowanie, a kiosk cały czas wisi podłączony.
+        db.upsert_track(&TrackRecord::new(
+            "C:\\muzyka\\kombi.mp3".to_string(),
+            "Słodkiego, miłego życia".to_string(),
+            "Kombi".to_string(),
+            None,
+            None,
+        ))
+        .expect("utwór w bibliotece");
+
+        send_message(
+            &mut ws,
+            &KioskMessage::Search {
+                request_id: 2,
+                query: "Kombi".to_string(),
+            },
+        )
+        .await;
+
+        match next_message(&mut ws).await {
+            Some(DjMessage::SearchResults { tracks, .. }) => {
+                assert_eq!(
+                    tracks.len(),
+                    1,
+                    "gość musi znaleźć utwór dodany już po połączeniu kiosku"
+                );
+                assert_eq!(tracks[0].artist, "Kombi");
+            }
+            other => panic!("oczekiwano wyników wyszukiwania, a przyszło {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_new_request_notifies_the_dj_interface() {
+        // Bez tego zdarzenia DJ widzi nową dedykację dopiero po przełączeniu widoku.
+        let db = Arc::new(Db::open_in_memory().expect("baza w pamięci"));
+
+        db.upsert_track(&TrackRecord::new(
+            "C:\\muzyka\\kombi.mp3".to_string(),
+            "Słodkiego, miłego życia".to_string(),
+            "Kombi".to_string(),
+            None,
+            None,
+        ))
+        .expect("utwór w bibliotece");
+
+        let port = free_port();
+        let (_server, mut events) = start_server(&db, port);
+
+        let mut ws = connect(port).await;
+        send_message(&mut ws, &hello(DEFAULT_PIN)).await;
+        assert!(next_message(&mut ws).await.is_some(), "parowanie");
+
+        // Zjadamy zdarzenia z samego połączenia kiosku — sprawdzamy dopiero zgłoszenie.
+        while events.try_recv().is_ok() {}
+
+        send_message(
+            &mut ws,
+            &KioskMessage::SubmitRequest {
+                request_id: 1,
+                track_id: 1,
+                dedication: "Sto lat!".to_string(),
+                guest_name: None,
+            },
+        )
+        .await;
+
+        assert!(matches!(
+            next_message(&mut ws).await,
+            Some(DjMessage::RequestReceived { .. })
+        ));
+
+        let mut notified = false;
+
+        while let Ok(event) = events.try_recv() {
+            if matches!(event, UiEvent::RequestsChanged) {
+                notified = true;
+            }
+        }
+
+        assert!(
+            notified,
+            "interfejs DJ-a musi dostać sygnał o nowej prośbie"
+        );
+    }
+
+    #[tokio::test]
     async fn the_same_dedication_cannot_be_sent_twice_in_a_row() {
         let db = Arc::new(Db::open_in_memory().expect("baza w pamięci"));
 
