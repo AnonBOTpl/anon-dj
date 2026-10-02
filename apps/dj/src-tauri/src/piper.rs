@@ -125,7 +125,26 @@ pub fn user_voices_dir(app_data_dir: &Path) -> PathBuf {
 /// Na Windows `resource_dir` to katalog, w którym leży plik wykonywalny, więc po instalacji
 /// głosy siedzą obok `dj.exe`, a w trybie deweloperskim — obok pliku zbudowanego przez cargo.
 pub fn bundled_voices_dir(resource_dir: &Path) -> PathBuf {
-    resource_dir.join(BUNDLED_VOICES_DIR_NAME)
+    simplify_windows_path(resource_dir).join(BUNDLED_VOICES_DIR_NAME)
+}
+
+/// Zdejmuje windowsowy prefiks verbatim (`\\?\`) ze ścieżki.
+///
+/// Po instalacji Tauri `resource_dir()` zwraca katalog właśnie w tej formie. Sherpa-onnx
+/// nie potrafi wczytać modelu spod takiej ścieżki — plik istnieje, a wczytanie i tak się
+/// nie udaje (sprawdzone eksperymentem: ta sama ścieżka bez prefiksu działa).
+/// `\\?\UNC\serwer\udzial\…` zamieniamy na `\\serwer\udzial\…`.
+pub fn simplify_windows_path(path: &Path) -> PathBuf {
+    let text = path.to_string_lossy();
+
+    if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
+        return PathBuf::from(format!(r"\\{rest}"));
+    }
+
+    match text.strip_prefix(r"\\?\") {
+        Some(rest) => PathBuf::from(rest),
+        None => path.to_path_buf(),
+    }
 }
 
 /// Wszystkie katalogi z głosami, w kolejności czytania.
@@ -183,6 +202,12 @@ pub fn discover_voices(voices_dir: &Path) -> Result<Vec<Voice>, TtsError> {
         let dir = entry.path();
 
         if !dir.is_dir() {
+            continue;
+        }
+
+        // Wspólny katalog danych espeak-ng leży obok głosów, ale głosem nie jest.
+        // Bez tego trafiałby do ostrzeżeń jako „niekompletny głos lektora”.
+        if dir.file_name().and_then(|name| name.to_str()) == Some(DATA_DIR_NAME) {
             continue;
         }
 
@@ -577,6 +602,55 @@ mod tests {
             discover_voices(&missing).expect("brak katalogu").is_empty(),
             "świeża instalacja nie ma głosów i aplikacja ma mimo to wystartować"
         );
+    }
+
+    #[test]
+    fn a_verbatim_path_is_simplified_before_use() {
+        // Po instalacji Tauri podaje katalog zasobów z prefiksem `\\?\`, którego sherpa-onnx
+        // nie potrafi odczytać — plik jest, a wczytanie i tak się nie udaje.
+        assert_eq!(
+            simplify_windows_path(Path::new(r"\\?\C:\voices")),
+            PathBuf::from(r"C:\voices"),
+            "prefiks verbatim musi zniknąć ze zwykłej ścieżki"
+        );
+
+        assert_eq!(
+            simplify_windows_path(Path::new(r"\\?\UNC\serwer\udzial")),
+            PathBuf::from(r"\\serwer\udzial"),
+            "ścieżka sieciowa wraca do formy UNC"
+        );
+
+        assert_eq!(
+            simplify_windows_path(Path::new(r"C:\voices")),
+            PathBuf::from(r"C:\voices"),
+            "zwykła ścieżka zostaje bez zmian"
+        );
+    }
+
+    #[test]
+    fn the_bundled_directory_drops_the_verbatim_prefix() {
+        let resources = PathBuf::from(r"\\?\C:\Program Files\ANON DJ");
+
+        assert_eq!(
+            bundled_voices_dir(&resources),
+            PathBuf::from(r"C:\Program Files\ANON DJ\voices"),
+            "głosy z instalatora muszą trafić do silnika bez prefiksu verbatim"
+        );
+    }
+
+    #[test]
+    fn the_espeak_data_directory_is_not_a_voice() {
+        let root = temp_dir("espeak-noise");
+
+        voice_dir(&root, "justyna", true, None);
+        // Katalog danych espeak leży obok głosów, ale głosem nie jest — nie może trafiać
+        // na listę ani do ostrzeżeń o niekompletnym głosie.
+        std::fs::create_dir_all(root.join(DATA_DIR_NAME)).expect("katalog espeak");
+
+        let voices = discover_voices(&root).expect("wykrywanie głosów");
+        let ids: Vec<&str> = voices.iter().map(|voice| voice.id.as_str()).collect();
+
+        assert_eq!(ids, vec!["justyna"]);
     }
 
     #[test]
