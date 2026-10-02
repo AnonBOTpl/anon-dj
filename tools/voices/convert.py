@@ -25,13 +25,16 @@ Skrypt uruchamia się raz, przy przygotowaniu głosów. Modele nie trafiają do 
 
 Wymagania: `pip install onnx`.
 
-Przykład:
+Przykład (głosy do instalatora):
 
     python tools/voices/convert.py \\
         --source .tmp/tts-probe/voices \\
-        --dest "%APPDATA%/pl.anondj.dj/voices" \\
+        --dest apps/dj/src-tauri/voices \\
         --espeak-ng-data .tmp/tts-probe/sherpa/espeak-ng-data \\
         --only pl_PL-justyna_wg_glos-medium,pl_PL-jarvis_wg_glos-medium
+
+Głos dołożony ręcznie już po instalacji kierujemy do "%APPDATA%/pl.anondj.dj/voices" —
+aplikacja czyta oba katalogi (najpierw zasoby instalatora, potem dane aplikacji).
 
 Gdy nie masz jeszcze `espeak-ng-data`, dodaj `--download-espeak` — skrypt pobierze wspólną
 paczkę z wydań sherpa-onnx.

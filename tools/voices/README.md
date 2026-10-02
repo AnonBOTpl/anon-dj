@@ -42,22 +42,25 @@ Potrzebny jest Python z pakietem `onnx`:
 pip install onnx
 ```
 
-Konwersja wybranych głosów:
+Konwersja wybranych głosów do instalatora:
 
 ```bash
 python tools/voices/convert.py \
   --source sciezka/do/surowych/glosow \
-  --dest sciezka/do/katalogu/pakowanego/przez/instalator \
+  --dest apps/dj/src-tauri/voices \
   --espeak-ng-data sciezka/do/espeak-ng-data \
   --only pl_PL-justyna_wg_glos-medium,pl_PL-jarvis_wg_glos-medium
 ```
 
-`--dest` wskazuje katalog, który trafia do instalatora — według planu pakujemy **wszystkie pięć
-głosów**, więc bez `--only` przerabia cały zestaw znaleziony w `--source`. Powtórne uruchomienie
-pomija głosy, które już są na miejscu (nadpisze je `--force`).
+`--dest apps/dj/src-tauri/voices` to katalog, który `tauri.conf.json` pakuje do instalatora
+(`bundle.resources`), a `build.rs` sprawdza przed buildem — bez niego instalator wyjdzie bez
+lektora (build wypisze wtedy ostrzeżenie). Katalog jest w `.gitignore`, bo modele mają po ~60 MB.
+Według planu pakujemy **wszystkie pięć głosów**, więc bez `--only` przerabia cały zestaw znaleziony
+w `--source`. Powtórne uruchomienie pomija głosy, które już są na miejscu (nadpisze je `--force`).
 
 Ten sam skrypt przydaje się, gdy DJ chce dołożyć głos ręcznie już po instalacji — wtedy `--dest`
-celuje w `%APPDATA%\pl.anondj.dj\voices`, które aplikacja też czyta (obok głosów z instalatora).
+celuje w `%APPDATA%\pl.anondj.dj\voices`. Aplikacja czyta oba katalogi: najpierw głosy
+z instalatora, potem te dołożone ręcznie (`piper::voice_dirs`).
 
 Gdy nie masz `espeak-ng-data`, dodaj `--download-espeak` — skrypt pobierze wspólną paczkę
 z wydań sherpa-onnx. Razem z katalogiem głosów zajmuje ona ~7 MB.

@@ -1235,9 +1235,19 @@ pub fn run() {
 
             // Lektor przygotowujemy z gotowych plików; brak głosów nie może zatrzymać startu —
             // wtedy aplikacja działa bez voice-overu, a DJ czyta dedykację z ekranu.
-            let voices_dir = piper::default_voices_dir(&app_data_dir);
+            // Głosy szukamy najpierw w zasobach instalatora, a potem w danych aplikacji, gdzie
+            // DJ może dołożyć własne (PLAN.md, sekcja 8).
+            let resource_dir = match handle.path().resource_dir() {
+                Ok(dir) => dir,
+                Err(error) => {
+                    warn!(error = %error, "nie znam katalogu zasobów, szukam głosów tylko w danych aplikacji");
+
+                    app_data_dir.clone()
+                }
+            };
+            let voices_dirs = piper::voice_dirs(&app_data_dir, &resource_dir);
             let cache = crate::tts::ClipCache::new(app_data_dir.join("tts-cache"));
-            let tts = match piper::discover_voices(&voices_dir) {
+            let tts = match piper::discover_all_voices(&voices_dirs) {
                 Ok(voices) => {
                     let preferred = settings
                         .lock()
@@ -1253,12 +1263,17 @@ pub fn run() {
                 }
             };
 
+            let searched: Vec<String> = voices_dirs
+                .iter()
+                .map(|dir| dir.display().to_string())
+                .collect();
+
             match (tts.selected(), tts.unavailable_reason()) {
                 (Some(voice), _) => {
-                    info!(voice, voices_dir = %voices_dir.display(), "lektor gotowy")
+                    info!(voice, voices_dirs = ?searched, "lektor gotowy")
                 }
                 (None, reason) => warn!(
-                    voices_dir = %voices_dir.display(),
+                    voices_dirs = ?searched,
                     reason = reason.unwrap_or("nieznany powód"),
                     "lektor niedostępny — dedykacje trzeba przeczytać z ekranu"
                 ),

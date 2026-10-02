@@ -38,6 +38,8 @@ const TOKENS_FILE_NAME: &str = "tokens.txt";
 const DATA_DIR_NAME: &str = "espeak-ng-data";
 /// Opcjonalny opis głosu — uzupełnia to, czego nie ma w samych plikach modelu.
 const METADATA_FILE_NAME: &str = "voice.json";
+/// Nazwa katalogu z głosami wewnątrz zasobów aplikacji (instalator pakuje go jako całość).
+const BUNDLED_VOICES_DIR_NAME: &str = "voices";
 
 /// Ile wątków dostaje synteza. Dwa wystarczają (synteza jest krótsza niż czas rzeczywisty),
 /// a nie zabierają całego procesora aplikacji, która w tym czasie obsługuje imprezę.
@@ -113,9 +115,51 @@ struct VoiceMetadata {
     quality: Option<String>,
 }
 
-/// Domyślny katalog z głosami w danych aplikacji.
-pub fn default_voices_dir(app_data_dir: &Path) -> PathBuf {
-    app_data_dir.join("voices")
+/// Katalog z głosami dodanymi ręcznie, w danych aplikacji.
+pub fn user_voices_dir(app_data_dir: &Path) -> PathBuf {
+    app_data_dir.join(BUNDLED_VOICES_DIR_NAME)
+}
+
+/// Katalog z głosami dołączonymi do instalatora (Tauri `bundle.resources`).
+///
+/// Na Windows `resource_dir` to katalog, w którym leży plik wykonywalny, więc po instalacji
+/// głosy siedzą obok `dj.exe`, a w trybie deweloperskim — obok pliku zbudowanego przez cargo.
+pub fn bundled_voices_dir(resource_dir: &Path) -> PathBuf {
+    resource_dir.join(BUNDLED_VOICES_DIR_NAME)
+}
+
+/// Wszystkie katalogi z głosami, w kolejności czytania.
+///
+/// Najpierw głosy z instalatora (komplet, jaki dostaje każdy DJ), potem te dołożone ręcznie
+/// w danych aplikacji — dzięki temu DJ, który dorzuci sobie własny głos, może wybrać go obok
+/// fabrycznych. Kolejność jest istotna: przy dwóch głosach o tym samym identyfikatorze wygrywa
+/// ten wcześniejszy, a duplikaty widzimy raz.
+pub fn voice_dirs(app_data_dir: &Path, resource_dir: &Path) -> Vec<PathBuf> {
+    vec![
+        bundled_voices_dir(resource_dir),
+        user_voices_dir(app_data_dir),
+    ]
+}
+
+/// Scala głosy ze wszystkich katalogów, pomijając duplikaty identyfikatorów.
+pub fn discover_all_voices(dirs: &[PathBuf]) -> Result<Vec<Voice>, TtsError> {
+    let mut voices: Vec<Voice> = Vec::new();
+
+    for dir in dirs {
+        for voice in discover_voices(dir)? {
+            if voices.iter().any(|known| known.id == voice.id) {
+                warn!(voice = %voice.id, dir = %dir.display(), "pomijam głos o powtórzonym identyfikatorze");
+
+                continue;
+            }
+
+            voices.push(voice);
+        }
+    }
+
+    voices.sort_by(|left, right| left.id.cmp(&right.id));
+
+    Ok(voices)
 }
 
 /// Wypisuje głosy znalezione w katalogu, alfabetycznie po identyfikatorze.
@@ -533,6 +577,56 @@ mod tests {
             discover_voices(&missing).expect("brak katalogu").is_empty(),
             "świeża instalacja nie ma głosów i aplikacja ma mimo to wystartować"
         );
+    }
+
+    #[test]
+    fn the_bundled_and_user_directories_are_searched_in_order() {
+        let app_data = temp_dir("dirs-app-data");
+        let resources = temp_dir("dirs-resources");
+
+        let dirs = voice_dirs(&app_data, &resources);
+
+        assert_eq!(
+            dirs,
+            vec![
+                resources.join(BUNDLED_VOICES_DIR_NAME),
+                app_data.join(BUNDLED_VOICES_DIR_NAME),
+            ],
+            "najpierw głosy z instalatora, potem te dołożone ręcznie"
+        );
+    }
+
+    #[test]
+    fn voices_from_both_directories_are_merged_without_duplicates() {
+        let bundled = temp_dir("merge-bundled");
+        let user = temp_dir("merge-user");
+
+        voice_dir(&bundled, "justyna", true, None);
+        voice_dir(&bundled, "jarvis", true, None);
+        // Ten sam głos w obu katalogach nie może pokazać się dwa razy na liście DJ-a.
+        voice_dir(&user, "justyna", true, None);
+        voice_dir(&user, "moj_glos", true, None);
+
+        let voices = discover_all_voices(&[bundled, user]).expect("wykrywanie głosów");
+
+        let ids: Vec<&str> = voices.iter().map(|voice| voice.id.as_str()).collect();
+
+        assert_eq!(ids, vec!["jarvis", "justyna", "moj_glos"]);
+    }
+
+    #[test]
+    fn a_missing_directory_among_several_does_not_break_discovery() {
+        let bundled = temp_dir("merge-missing-bundled");
+        let user = temp_dir("merge-missing-user");
+
+        voice_dir(&user, "justyna", true, None);
+
+        // Instalator bez głosów: katalog z zasobami po prostu nie istnieje.
+        let voices =
+            discover_all_voices(&[bundled.join("nie-ma"), user]).expect("wykrywanie głosów");
+
+        assert_eq!(voices.len(), 1);
+        assert_eq!(voices[0].id, "justyna");
     }
 
     #[test]
