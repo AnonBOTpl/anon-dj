@@ -6,7 +6,7 @@
 //! z ekranem, który nic nie robi.
 
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use futures_util::{SinkExt, StreamExt};
 use protocol::{
@@ -26,6 +26,15 @@ const INITIAL_BACKOFF: Duration = Duration::from_secs(1);
 
 /// Najdłuższa przerwa przed ponowieniem — dłuższe czekanie denerwuje gościa.
 const MAX_BACKOFF: Duration = Duration::from_secs(15);
+
+/// Co ile kiosk odzywa się znacznikiem życia.
+const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Po jakim czasie ciszy uznajemy połączenie za martwe i łączymy się od nowa.
+///
+/// Bez tego zerwane łącze (kabel, uśpiony komputer DJ-a) zostawia kiosk w stanie „połączony”
+/// z pustą listą wyników — gość nie wie, dlaczego nic nie działa.
+const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Zakres portu, jaki można wpisać na ekranie konfiguracji.
 pub const PORT_RANGE: (u16, u16) = (1024, 65_535);
@@ -379,11 +388,32 @@ impl Client {
             return SessionEnd::Stop;
         }
 
+        let mut heartbeat = tokio::time::interval(HEARTBEAT_INTERVAL);
+        // Pierwszy tick wypada od razu — przesuwamy go, bo z aplikacją DJ-a dopiero co rozmawialiśmy.
+        heartbeat.tick().await;
+        let mut last_seen = Instant::now();
+
         loop {
+            // Cisza dłuższa niż kilka znaczników znaczy, że łącze padło, choć gniazdo tego nie
+            // zauważyło. Wracamy do pętli łączenia, żeby gość nie został z martwym ekranem.
+            if last_seen.elapsed() > HEARTBEAT_TIMEOUT {
+                warn!("aplikacja DJ-a milczy, łączę się od nowa");
+
+                return SessionEnd::Retry;
+            }
+
             tokio::select! {
+                _ = heartbeat.tick() => {
+                    if !send_ws(&mut sink, &KioskMessage::Ping).await {
+                        return SessionEnd::Retry;
+                    }
+                }
                 incoming_message = incoming.next() => {
                     match incoming_message {
                         Some(Ok(Message::Text(text))) => {
+                            // Cokolwiek przyszło od aplikacji DJ-a, jest dowodem, że żyje.
+                            last_seen = Instant::now();
+
                             if self.handle_dj_message(text.as_str()) == SessionEnd::Stop {
                                 return SessionEnd::Stop;
                             }
@@ -439,6 +469,8 @@ impl Client {
             DjMessage::Error { request_id, code } => {
                 self.emit(UiEvent::Error { request_id, code });
             }
+            // Odpowiedź na nasz znacznik życia — wystarczy, że doszła.
+            DjMessage::Pong => {}
             // Powtórzone hello_ok w trakcie rozmowy nie niesie nic nowego.
             DjMessage::HelloOk { .. } => {}
         }
@@ -725,6 +757,21 @@ mod tests {
             }
             other => panic!("oczekiwano wyników, a przyszło {other:?}"),
         }
+    }
+
+    #[test]
+    fn a_pong_is_accepted_as_proof_of_life() {
+        let (events, mut received) = mpsc::unbounded_channel();
+        let client = Client::new(events);
+
+        let raw = DjMessage::Pong.to_json().expect("kodowanie pong");
+
+        // Pong nie jest błędem ani końcem sesji — po prostu dowodzi, że aplikacja DJ-a żyje.
+        assert_eq!(client.handle_dj_message(&raw), SessionEnd::Retry);
+        assert!(
+            received.try_recv().is_err(),
+            "pong nie jest zdarzeniem dla interfejsu"
+        );
     }
 
     #[test]

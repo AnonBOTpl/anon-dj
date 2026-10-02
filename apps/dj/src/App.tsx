@@ -60,6 +60,16 @@ const EVENT_KIOSK_STATUS = "kiosk://status";
  */
 const PLAYER_POLL_MS = 2_000;
 
+/**
+ * Co ile odpyujemy stan serwera kiosków.
+ *
+ * Zdarzenie `kiosk://status` daje natychmiastową reakcję, ale potrafi przepaść — na przykład gdy
+ * kiosk połączy się, zanim interfejs zdąży się na nie zapisać. Wtedy chip zacinął się na
+ * nieaktualnym stanie („rozłączony” przy działającym kiosku). Odpytanie jest tą siatką
+ * bezpieczeństwa: po jednym cyklu chip sam wraca do prawdy.
+ */
+const SERVER_POLL_MS = 3_000;
+
 // Ustawień nie ma na tej liście: otwierają się jako okno nad bieżącym widokiem, więc nie trzeba
 // przerywać tego, co DJ akurat robi w kolejkach.
 type View = "queues" | "library" | "voice";
@@ -137,22 +147,27 @@ export default function App() {
   const [view, setView] = useState<View>("queues");
   const [settingsOpen, setSettingsOpen] = useState(false);
 
-  // Serwer kiosków melduje się zdarzeniem; na starcie pytamy o stan raz, żeby pasek statusu
-  // nie czekał na pierwsze połączenie.
+  // Serwer kiosków melduje się zdarzeniem, a stan dodatkowo odpytujemy w pętli: zdarzenie daje
+  // natychmiastową reakcję, a odpytanie ratuje sytuację, gdy zdarzenie przepadnie.
   useEffect(() => {
     let active = true;
 
-    invoke<ServerStatus>("server_status")
-      .then((value) => {
-        if (active) {
-          setServer(value);
-        }
-      })
-      .catch((reason: unknown) => {
-        if (active) {
-          setError(String(reason));
-        }
-      });
+    const poll = () => {
+      invoke<ServerStatus>("server_status")
+        .then((value) => {
+          if (active) {
+            setServer(value);
+          }
+        })
+        .catch((reason: unknown) => {
+          if (active) {
+            setError(String(reason));
+          }
+        });
+    };
+
+    poll();
+    const timer = window.setInterval(poll, SERVER_POLL_MS);
 
     const unlisten = listen<ServerStatus>(EVENT_KIOSK_STATUS, (event) => {
       setServer(event.payload);
@@ -160,6 +175,7 @@ export default function App() {
 
     return () => {
       active = false;
+      window.clearInterval(timer);
       void unlisten.then((stop) => stop());
     };
   }, []);

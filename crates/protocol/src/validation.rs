@@ -204,6 +204,8 @@ impl KioskMessage {
 
                 Ok(())
             }
+            // Znacznik życia nie niesie treści — nie ma czego sprawdzać.
+            Self::Ping => Ok(()),
         }
     }
 }
@@ -227,6 +229,22 @@ mod tests {
             dedication: dedication.to_string(),
             guest_name: guest_name.map(str::to_string),
         }
+    }
+
+    #[test]
+    fn a_heartbeat_passes_validation_and_is_marked_as_one() {
+        let ping = KioskMessage::Ping;
+
+        assert!(ping.validate().is_ok(), "znacznik życia nie ma czego łamać");
+        assert!(ping.is_heartbeat());
+        assert!(
+            !KioskMessage::Search {
+                request_id: 1,
+                query: "kombi".to_string(),
+            }
+            .is_heartbeat()
+        );
+        assert_eq!(ping.request_id(), None);
     }
 
     #[test]

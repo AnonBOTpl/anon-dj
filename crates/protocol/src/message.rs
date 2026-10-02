@@ -148,6 +148,11 @@ pub enum KioskMessage {
         dedication: String,
         guest_name: Option<String>,
     },
+    /// Znacznik życia: kiosk odzywa się, gdy nie ma nic do powiedzenia.
+    ///
+    /// Bez tego zerwane łącznie (kabel, uśpiony komputer) zostaje w aplikacji DJ-a jako
+    /// „podłączony”, dopóki system sam nie zauważy, że TCP umarł — a to potrafi trwać minuty.
+    Ping,
 }
 
 /// Wiadomości wysyłane przez aplikację DJ-a.
@@ -190,6 +195,8 @@ pub enum DjMessage {
         request_id: Option<u64>,
         code: ErrorCode,
     },
+    /// Odpowiedź na [`KioskMessage::Ping`].
+    Pong,
 }
 
 /// Błąd parsowania lub serializacji komunikatu.
@@ -220,11 +227,19 @@ impl KioskMessage {
     /// Identyfikator prośby, jeśli komunikat go niesie — do logów i odpowiedzi z błędem.
     pub fn request_id(&self) -> Option<u64> {
         match self {
-            Self::Hello { .. } => None,
+            Self::Hello { .. } | Self::Ping => None,
             Self::Search { request_id, .. }
             | Self::Suggest { request_id, .. }
             | Self::SubmitRequest { request_id, .. } => Some(*request_id),
         }
+    }
+
+    /// Czy to znacznik życia — nie liczy się do limitu tempa.
+    ///
+    /// Ping leci w regularnych odstępach i nie jest ruchem gościa, więc nie może zjadać budżetu
+    /// przeznaczonego na wyszukiwania i zgłoszenia.
+    pub fn is_heartbeat(&self) -> bool {
+        matches!(self, Self::Ping)
     }
 }
 
@@ -310,6 +325,23 @@ mod tests {
         assert_eq!(message, parsed);
         assert_eq!(parsed.request_id(), Some(12));
         assert!(json.contains("\"type\":\"suggest\""), "{json}");
+    }
+
+    #[test]
+    fn heartbeat_round_trips() {
+        let json = KioskMessage::Ping.to_json().expect("serializacja");
+        assert!(json.contains("\"type\":\"ping\""), "{json}");
+        assert_eq!(
+            KioskMessage::from_json(&json).expect("deserializacja"),
+            KioskMessage::Ping
+        );
+
+        let json = DjMessage::Pong.to_json().expect("serializacja");
+        assert!(json.contains("\"type\":\"pong\""), "{json}");
+        assert_eq!(
+            DjMessage::from_json(&json).expect("deserializacja"),
+            DjMessage::Pong
+        );
     }
 
     #[test]

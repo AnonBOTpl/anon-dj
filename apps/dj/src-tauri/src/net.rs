@@ -64,6 +64,13 @@ const DUPLICATE_WINDOW: Duration = Duration::from_secs(30);
 /// Przerwa przed ponowną próbą, gdy nasłuch nie mógł wystartować (np. port zajęty).
 const RESTART_DELAY: Duration = Duration::from_secs(5);
 
+/// Po jakim czasie ciszy uznajemy kiosk za rozłączony.
+///
+/// Zerwane łącze (kabel, uśpiony komputer) nie zawsze kończy się zamknięciem gniazda, więc bez
+/// tego licznika kiosk wisiałby w panelu DJ-a jako „podłączony” mimo braku łączności. Trzy
+/// nieodebrane znaczniki to już nie chwilowe zająknięcie sieci.
+const KIOSK_IDLE_TIMEOUT: Duration = Duration::from_secs(15);
+
 /// Zdarzenie dla interfejsu DJ-a.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UiEvent {
@@ -95,6 +102,8 @@ struct State {
     sessions: HashMap<i64, u64>,
     /// Licznik numerów połączeń.
     next_session: u64,
+    /// Kiedy ostatnio usłyszeliśmy ten kiosk (cokolwiek przysłał, także znacznik życia).
+    last_seen: HashMap<i64, Instant>,
     limiter: RateLimiter,
     /// Osobny licznik tempa dla podpowiedzi — patrz [`SUGGEST_RATE_MAX_MESSAGES`].
     suggest_limiter: RateLimiter,
@@ -140,16 +149,43 @@ impl Server {
     }
 
     /// Nazwy podłączonych kiosków — do paska statusu DJ-a.
+    ///
+    /// Ciszę dłuższą niż [`KIOSK_IDLE_TIMEOUT`] traktujemy jak rozłączenie i sprzątamy wpis:
+    /// kiosk zostanie przyjęty od nowa, gdy wróci. Wołane także z paska statusu, więc widok
+    /// „podłączony” nie zacina się na martwym łączu.
     pub fn connected_kiosks(&self) -> Vec<String> {
-        match self.state.lock() {
-            Ok(state) => {
-                let mut names: Vec<String> = state.kiosks.values().cloned().collect();
-                names.sort();
+        let now = Instant::now();
 
-                names
+        let mut state = match self.state.lock() {
+            Ok(state) => state,
+            Err(_) => return Vec::new(),
+        };
+
+        let stale: Vec<i64> = state
+            .last_seen
+            .iter()
+            .filter(|(_, seen)| now.duration_since(**seen) > KIOSK_IDLE_TIMEOUT)
+            .map(|(kiosk_id, _)| *kiosk_id)
+            .collect();
+
+        if !stale.is_empty() {
+            for kiosk_id in &stale {
+                warn!(kiosk_id, "kiosk milczy od dawna, uznaję go za rozłączony");
             }
-            Err(_) => Vec::new(),
+
+            forget_kiosks(&mut state, &stale);
         }
+
+        let mut names: Vec<String> = state.kiosks.values().cloned().collect();
+        names.sort();
+
+        drop(state);
+
+        if !stale.is_empty() {
+            self.emit(UiEvent::KiosksChanged);
+        }
+
+        names
     }
 
     /// Mówi interfejsowi DJ-a, że zmieniła się kolejka prośb.
@@ -313,6 +349,8 @@ impl Server {
         let (outbox, mut outgoing) = mpsc::unbounded_channel();
         let session = self.mark_connected(kiosk_id, name.clone(), outbox);
 
+        // Znacznik życia: kiosk odzywa się co [`HEARTBEAT_INTERVAL`], a my odpowiadamy pongiem.
+        // Ten rytm daje nam wykrywanie martwego łącza, a kioskowi — dowód, że my też żyjemy.
         loop {
             tokio::select! {
                 incoming = stream.next() => {
@@ -496,8 +534,15 @@ impl Server {
             return true;
         }
 
+        // Każdy odebrany komunikat, także znacznik życia, jest dowodem, że kiosk żyje.
+        self.touch(kiosk_id);
+
         // Podpowiedzi mają własny budżet, żeby piszący gość nie zjadł limitu na zgłoszenia.
-        let allowed = if matches!(message, KioskMessage::Suggest { .. }) {
+        // Znacznik życia nie liczy się wcale — to nie ruch gościa, a przy 5-sekundowym odstępie
+        // zjadałby limit przewidziany na prawdziwe komunikaty.
+        let allowed = if message.is_heartbeat() {
+            true
+        } else if matches!(message, KioskMessage::Suggest { .. }) {
             self.allow_suggestion(kiosk_id)
         } else {
             self.allow_message(kiosk_id)
@@ -521,6 +566,14 @@ impl Server {
                 send(sink, &error_message(None, ErrorCode::InvalidMessage)).await;
 
                 false
+            }
+            // Znacznik życia: odsyłamy pong, żeby kiosk wiedział, że my też żyjemy. Limitu tempa
+            // nie ruszamy — to nie jest ruch gościa.
+            KioskMessage::Ping => {
+                self.touch(kiosk_id);
+                send(sink, &DjMessage::Pong).await;
+
+                true
             }
             KioskMessage::Search { request_id, query } => {
                 self.handle_search(request_id, &query, sink).await;
@@ -814,6 +867,13 @@ impl Server {
         }
     }
 
+    /// Odnotowuje, że kiosk się właśnie odezwał — to podstawa wykrywania martwego łącza.
+    fn touch(&self, kiosk_id: i64) {
+        if let Ok(mut state) = self.state.lock() {
+            state.last_seen.insert(kiosk_id, Instant::now());
+        }
+    }
+
     /// To samo dla podpowiedzi, ale z osobnego licznika — dzięki temu pisanie nie zjada limitu
     /// przeznaczonego na zgłoszenia (PLAN.md, sekcja 11).
     fn allow_suggestion(&self, kiosk_id: i64) -> bool {
@@ -841,6 +901,7 @@ impl Server {
                 state.kiosks.insert(kiosk_id, name);
                 state.outboxes.insert(kiosk_id, outbox);
                 state.sessions.insert(kiosk_id, session);
+                state.last_seen.insert(kiosk_id, Instant::now());
 
                 session
             }
@@ -861,12 +922,7 @@ impl Server {
                     return;
                 }
 
-                state.sessions.remove(&kiosk_id);
-                state.kiosks.remove(&kiosk_id);
-                state.outboxes.remove(&kiosk_id);
-                // Historia tempa nie jest już potrzebna — kiosk przyjdzie od nowa.
-                state.limiter.forget(kiosk_id);
-                state.suggest_limiter.forget(kiosk_id);
+                forget_kiosks(&mut state, &[kiosk_id]);
             }
             Err(_) => return,
         };
@@ -901,6 +957,20 @@ impl Server {
             Ok(settings) => settings.pin == pin,
             Err(_) => false,
         }
+    }
+}
+
+/// Usuwa kioski z całego stanu: nazwy, kanału wysyłkowego, numeru sesji, czasu ostatniej
+/// aktywności oraz historii tempa. Wspólne dla rozłączenia i wykrycia ciszy.
+fn forget_kiosks(state: &mut State, kiosk_ids: &[i64]) {
+    for kiosk_id in kiosk_ids {
+        state.sessions.remove(kiosk_id);
+        state.kiosks.remove(kiosk_id);
+        state.outboxes.remove(kiosk_id);
+        state.last_seen.remove(kiosk_id);
+        // Historia tempa nie jest już potrzebna — kiosk przyjdzie od nowa.
+        state.limiter.forget(*kiosk_id);
+        state.suggest_limiter.forget(*kiosk_id);
     }
 }
 
@@ -1064,16 +1134,21 @@ mod tests {
     }
 
     /// Odbiera komunikat z serwera. `None` oznacza zamknięcie połączenia.
+    ///
+    /// Znaczniki życia pomijamy — testy nie czekają na nie, a serwer wysyła je w tle.
     async fn next_message(ws: &mut ClientStream) -> Option<DjMessage> {
-        let incoming = tokio::time::timeout(Duration::from_secs(5), ws.next())
-            .await
-            .expect("serwer milczy")
-            .expect("połączenie zamknięte")
-            .expect("błąd odczytu");
+        loop {
+            let incoming = tokio::time::timeout(Duration::from_secs(5), ws.next())
+                .await
+                .expect("serwer milczy")
+                .expect("połączenie zamknięte")
+                .expect("błąd odczytu");
 
-        match incoming {
-            Message::Text(text) => DjMessage::from_json(text.as_str()).ok(),
-            _ => None,
+            match incoming {
+                Message::Text(text) => return DjMessage::from_json(text.as_str()).ok(),
+                Message::Ping(_) | Message::Pong(_) => continue,
+                _ => return None,
+            }
         }
     }
 
@@ -1087,6 +1162,37 @@ mod tests {
         server.spawn();
 
         (server, receiver)
+    }
+
+    #[tokio::test]
+    async fn a_heartbeat_is_answered_and_keeps_the_kiosk_connected() {
+        let db = Arc::new(Db::open_in_memory().expect("baza w pamięci"));
+
+        let port = free_port();
+        let (server, _events) = start_server(&db, port);
+
+        let mut ws = connect(port).await;
+        send_message(&mut ws, &hello(DEFAULT_PIN)).await;
+        assert!(matches!(
+            next_message(&mut ws).await,
+            Some(DjMessage::HelloOk { .. })
+        ));
+
+        // Kiosk odzywa się znacznikiem życia i dostaje odpowiedź.
+        send_message(&mut ws, &KioskMessage::Ping).await;
+        assert!(matches!(next_message(&mut ws).await, Some(DjMessage::Pong)));
+
+        // Znacznik nie liczy się do limitu tempa: wysyłamy ich więcej niż cały budżet.
+        for _ in 0..(RATE_MAX_MESSAGES + 5) {
+            send_message(&mut ws, &KioskMessage::Ping).await;
+            assert!(matches!(next_message(&mut ws).await, Some(DjMessage::Pong)));
+        }
+
+        assert_eq!(
+            server.connected_kiosks(),
+            vec!["Kiosk testowy".to_string()],
+            "znaczniki życia nie mogą wyrzucić kiosku z listy"
+        );
     }
 
     #[tokio::test]
@@ -1344,6 +1450,48 @@ mod tests {
             receiver.try_recv().is_ok(),
             "status musi trafić kanałem nowego połączenia"
         );
+    }
+
+    #[test]
+    fn a_silent_kiosk_is_dropped_instead_of_hanging_as_connected() {
+        let db = Arc::new(Db::open_in_memory().expect("baza w pamięci"));
+        let settings = Arc::new(Mutex::new(AppSettings::default()));
+        let (events, mut receiver) = mpsc::unbounded_channel();
+        let server = Server::new(db, settings, events, free_port());
+
+        let (outbox, _outbox_receiver) = mpsc::unbounded_channel();
+        server.mark_connected(1, "Kiosk".to_string(), outbox);
+
+        assert_eq!(server.connected_kiosks(), vec!["Kiosk".to_string()]);
+
+        // Zjadamy zdarzenie z samego połączenia, żeby sprawdzić to po wykryciu ciszy.
+        let _ = receiver.try_recv();
+
+        // Kabel wypadł, ale gniazdo tego nie zauważyło — kiosk milczy od dawna.
+        match server.state.lock() {
+            Ok(mut state) => {
+                state.last_seen.insert(
+                    1,
+                    Instant::now() - KIOSK_IDLE_TIMEOUT - Duration::from_secs(1),
+                );
+            }
+            Err(_) => panic!("stan serwera"),
+        }
+
+        assert!(
+            server.connected_kiosks().is_empty(),
+            "milczący kiosk nie może wisieć jako podłączony"
+        );
+        assert!(
+            matches!(receiver.try_recv(), Ok(UiEvent::KiosksChanged)),
+            "interfejs DJ-a musi dostać zmianę stanu"
+        );
+
+        // Kiosk wraca — jest przyjmowany od nowa, bez resztek po starym połączeniu.
+        let (outbox, _outbox_receiver) = mpsc::unbounded_channel();
+        server.mark_connected(1, "Kiosk".to_string(), outbox);
+
+        assert_eq!(server.connected_kiosks(), vec!["Kiosk".to_string()]);
     }
 
     #[tokio::test]
