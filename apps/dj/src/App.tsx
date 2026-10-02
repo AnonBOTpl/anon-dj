@@ -14,12 +14,14 @@ import {
   WifiOff,
 } from "lucide-react";
 
+import { CrashReportDialog } from "./components/CrashReportDialog";
 import { LibraryView } from "./components/LibraryView";
 import { QueuesView } from "./components/QueuesView";
 import { SettingsDialog } from "./components/SettingsDialog";
 import { TitleBar } from "./components/TitleBar";
 import { VoiceView } from "./components/VoiceView";
 import { ui } from "./text";
+import type { CrashReport } from "./types";
 
 /** Odpowiedź komendy `app_status` z warstwy Rust. */
 type AppStatus = {
@@ -146,6 +148,9 @@ export default function App() {
   const [error, setError] = useState<string | null>(null);
   const [view, setView] = useState<View>("queues");
   const [settingsOpen, setSettingsOpen] = useState(false);
+  // Raport awarii z poprzedniego uruchomienia. Aplikacja buduje się bez konsoli i z `panic = "abort"`,
+  // więc awaria nie zostawia śladu, którego DJ mógłby nie zauważyć — pokazujemy go tutaj.
+  const [crash, setCrash] = useState<CrashReport | null>(null);
 
   // Serwer kiosków melduje się zdarzeniem, a stan dodatkowo odpytujemy w pętli: zdarzenie daje
   // natychmiastową reakcję, a odpytanie ratuje sytuację, gdy zdarzenie przepadnie.
@@ -177,6 +182,24 @@ export default function App() {
       active = false;
       window.clearInterval(timer);
       void unlisten.then((stop) => stop());
+    };
+  }, []);
+
+  useEffect(() => {
+    let active = true;
+
+    invoke<CrashReport | null>("crash_report")
+      .then((value) => {
+        if (active) {
+          setCrash(value);
+        }
+      })
+      .catch(() => {
+        // Brak raportu to brak awarii — nie ma czego pokazywać ani o czym meldować.
+      });
+
+    return () => {
+      active = false;
     };
   }, []);
 
@@ -347,6 +370,10 @@ export default function App() {
       </footer>
 
       {settingsOpen && <SettingsDialog onClose={() => setSettingsOpen(false)} />}
+
+      {crash !== null && (
+        <CrashReportDialog report={crash} onClose={() => setCrash(null)} />
+      )}
     </div>
   );
 }

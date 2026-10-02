@@ -2,6 +2,8 @@
 
 mod audio;
 mod clips;
+// Raport awarii: panika zostawia plik, który DJ pokazuje przy następnym starcie.
+mod crash;
 mod db;
 // Sekwencja wykonania: duck, dedykacja, wyciszenie starego utworu i wejście zamówionego.
 mod execute;
@@ -77,6 +79,37 @@ struct AppState {
     clips: Arc<clips::ClipJobs>,
     /// Odtwarzanie voice-overu: osobne gniazda na antenę i na odsłuch DJ-a.
     audio: Arc<audio::VoiceOverPlayer>,
+}
+
+/// Raport awarii z poprzedniego uruchomienia.
+#[derive(Debug, Clone, serde::Serialize)]
+struct CrashReport {
+    /// Cała treść raportu — do pokazania i skopiowania.
+    text: String,
+    /// Ścieżka pliku, gdyby DJ wolał wysłać plik zamiast wklejać tekst.
+    path: String,
+}
+
+/// Raport awarii z poprzedniego uruchomienia. `null`, gdy poprzedni start skończył się czysto.
+///
+/// Aplikacja buduje się z `panic = "abort"` i bez konsoli, więc awaria nie zostawia śladu,
+/// którego DJ mógłby nie zauważyć. Raport czeka na dysku i tutaj trafia do okna.
+#[tauri::command]
+fn crash_report(state: tauri::State<'_, AppState>) -> Option<CrashReport> {
+    crash::pending_report(&state.log_dir).map(|text| CrashReport {
+        text,
+        path: crash::report_path(&state.log_dir).display().to_string(),
+    })
+}
+
+/// Zdejmuje raport awarii po tym, jak DJ go zobaczył — kolejny start ma być czysty.
+#[tauri::command]
+fn dismiss_crash_report(state: tauri::State<'_, AppState>) -> Result<(), String> {
+    crash::dismiss_report(&state.log_dir).map_err(|error| {
+        error!(error = %error, "nie udało się zdjąć raportu awarii");
+
+        format!("nie udało się zdjąć raportu awarii: {error}")
+    })
 }
 
 /// Stan lektora dla interfejsu DJ-a.
@@ -1199,6 +1232,9 @@ pub fn run() {
             let guard = logging::init(&log_dir)?;
             Box::leak(Box::new(guard));
 
+            // Raport awarii musi być uzbrojony, zanim cokolwiek poniżej zdąży panikować.
+            crash::install_hook(log_dir.clone());
+
             info!(db = %db_path.display(), "otwieram bazę danych");
             let db = Db::open(&db_path)?;
 
@@ -1306,6 +1342,8 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             app_status,
+            crash_report,
+            dismiss_crash_report,
             get_setting,
             set_setting,
             settings_snapshot,

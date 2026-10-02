@@ -165,6 +165,17 @@ export type TtsStatus = {
   voices: Voice[];
 };
 
+/**
+ * Raport awarii z poprzedniego uruchomienia — zgadza się z `CrashReport` w `src-tauri/src/lib.rs`.
+ * `null` (brak wartości) oznacza, że poprzedni start skończył się czysto.
+ */
+export type CrashReport = {
+  /** Cała treść raportu — do pokazania i skopiowania. */
+  text: string;
+  /** Ścieżka pliku z raportem, gdyby DJ wolał wysłać plik zamiast wklejać tekst. */
+  path: string;
+};
+
 /** Wynik podglądu głosu — zgadza się z `VoicePreview` w `src-tauri/src/lib.rs`. */
 export type VoicePreview = {
   /** Ile trwała synteza próbki. */

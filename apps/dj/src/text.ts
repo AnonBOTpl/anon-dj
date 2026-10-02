@@ -216,6 +216,16 @@ export const ui = {
     scanError: "Nie udało się uruchomić skanowania:",
     searchError: "Nie udało się wyszukać:",
   },
+  crash: {
+    title: "Raport awarii",
+    hint: "Aplikacja zakończyła się nieoczekiwanie. Skopiuj raport i wyślij go — bez niego nie da się ustalić przyczyny.",
+    reportLabel: "Treść raportu",
+    fileLabel: "Plik",
+    copy: "Kopiuj raport",
+    copied: "Skopiowano",
+    copyFallback: "Nie udało się skopiować — tekst jest zaznaczony, wciśnij Ctrl+C.",
+    close: "Zamknij",
+  },
   footer: {
     version: "Wersja",
     protocol: "Protokół",
