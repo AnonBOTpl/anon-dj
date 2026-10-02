@@ -7,6 +7,12 @@
 # Logi uruchomieniowe.
 *.log
 
+# Instalator zbiorczy: rozpakowana wtyczka beefweb, gotowe pliki wynikowe i wygenerowane
+# ścieżki dla NSIS-a. Wszystko odtwarzalne przez `packaging/build.sh`.
+/packaging/work
+/packaging/out
+/packaging/defines.nsh
+
 # Notatki robocze: plan, dziennik i instrukcje dla agentów zostają na dysku autora,
 # ale nie trafiają do repozytorium.
 /PLAN.md
